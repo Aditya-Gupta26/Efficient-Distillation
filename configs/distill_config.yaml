@@ -1,0 +1,58 @@
+# ============================================================
+# Swin-Transformer Knowledge Distillation — Configuration
+# ============================================================
+
+# ----------------------------------------------------------
+# Dataset
+# ----------------------------------------------------------
+coco_root:   "/data/coco"          # Path to COCO root directory
+img_size:    224                   # Input image resolution (H = W)
+batch_size:  32                    # Per-GPU batch size
+num_workers: 8
+pin_memory:  true
+
+# ----------------------------------------------------------
+# Teacher  (Swin-Large ~197M or Swin-Base ~88M)
+# ----------------------------------------------------------
+teacher_variant:        "swin_large"   # "swin_large" | "swin_base"
+teacher_pretrained:     true
+teacher_frozen_stages:  4              # Freeze ALL teacher stages during distil
+
+# ----------------------------------------------------------
+# Student  (Swin-Tiny ~28M)
+# ----------------------------------------------------------
+student_pretrained:  true
+num_classes:         80                # COCO categories
+
+# ----------------------------------------------------------
+# Adapters
+# ----------------------------------------------------------
+adapter_stages:         [0, 1, 2, 3]  # Which stages to attach adapters to
+adapter_spatial_align:  true
+
+# ----------------------------------------------------------
+# Distillation loss weights
+# ----------------------------------------------------------
+w_feat:          1.0    # Feature-level MSE / cosine
+w_at:            0.5    # Attention transfer
+w_kd:            1.0    # Logit-level KL divergence
+w_task:          1.0    # Task loss (detection / segmentation)
+feat_loss_type:  "mse"  # "mse" | "cosine"
+temperature:     4.0    # KD temperature (τ)
+
+# ----------------------------------------------------------
+# Optimiser & scheduler
+# ----------------------------------------------------------
+lr:            1.0e-4
+lr_min:        1.0e-6
+weight_decay:  1.0e-2
+grad_clip:     1.0
+epochs:        30
+
+# ----------------------------------------------------------
+# Mixed precision & checkpointing
+# ----------------------------------------------------------
+amp:       true
+log_every: 50                        # Log every N batches
+save_dir:  "checkpoints"
+resume:    null                      # Set to a .pth path to resume
