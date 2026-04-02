@@ -5,7 +5,7 @@
 # ----------------------------------------------------------
 # Dataset
 # ----------------------------------------------------------
-coco_root:   "/data/coco"          # Path to COCO root directory
+coco_root:   "/scratch/ag11023/HPML/coco"  # Path to COCO root directory
 img_size:    224                   # Input image resolution (H = W)
 batch_size:  32                    # Per-GPU batch size
 num_workers: 8
@@ -47,7 +47,7 @@ lr:            1.0e-4
 lr_min:        1.0e-6
 weight_decay:  1.0e-2
 grad_clip:     1.0
-epochs:        30
+epochs:        1000
 
 # ----------------------------------------------------------
 # Mixed precision & checkpointing
@@ -56,3 +56,13 @@ amp:       true
 log_every: 50                        # Log every N batches
 save_dir:  "checkpoints"
 resume:    null                      # Set to a .pth path to resume
+
+# ----------------------------------------------------------
+# Weights & Biases
+# ----------------------------------------------------------
+wandb:
+  enabled:  true
+  project:  "efficient-distillation"
+  entity:   "ag11023-new-york-university"
+  run_name: null          # null → wandb auto-generates a name
+  tags:     ["swin", "knowledge-distillation", "coco"]

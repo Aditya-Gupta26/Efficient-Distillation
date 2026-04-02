@@ -19,6 +19,7 @@ from distillation.losses import DistillationLoss
 from distillation.trainer import DistillationTrainer
 from data.coco_dataset import build_coco_dataloaders
 from utils.logger import setup_logger
+from utils.wandb_logger import init_wandb
 
 
 def parse_args():
@@ -42,6 +43,11 @@ def main():
     # Allow CLI override for resume path
     if args.resume:
         cfg["resume"] = args.resume
+
+    # ------------------------------------------------------------------ #
+    # Weights & Biases
+    # ------------------------------------------------------------------ #
+    wandb_run = init_wandb(cfg)
 
     # ------------------------------------------------------------------ #
     # Device
@@ -127,8 +133,12 @@ def main():
         val_loader   = val_loader,
         cfg          = cfg,
         device       = device,
+        wandb_run    = wandb_run,
     )
     trainer.train()
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

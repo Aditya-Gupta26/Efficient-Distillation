@@ -56,6 +56,7 @@ class DistillationTrainer:
         val_loader: DataLoader,
         cfg: dict,
         device: torch.device,
+        wandb_run=None,
     ):
         self.teacher      = teacher.to(device)
         self.student      = student.to(device)
@@ -66,6 +67,7 @@ class DistillationTrainer:
         self.cfg          = cfg
         self.device       = device
         self.logger       = setup_logger("DistillationTrainer")
+        self.wandb_run    = wandb_run
 
         # Teacher is always in eval mode — we only distil from it
         self.teacher.eval()
@@ -125,6 +127,20 @@ class DistillationTrainer:
                 f"kd={train_losses['kd']:.4f}) | "
                 f"Val mAP: {val_metrics.get('mAP', 0.0):.4f}"
             )
+
+            if self.wandb_run is not None:
+                epoch_log = {
+                    "epoch": epoch + 1,
+                    "epoch/train_loss_total": train_losses["total"],
+                    "epoch/train_loss_feat":  train_losses["feat"],
+                    "epoch/train_loss_at":    train_losses["at"],
+                    "epoch/train_loss_kd":    train_losses["kd"],
+                    "epoch/val_mAP":          val_metrics.get("mAP", 0.0),
+                    "epoch/val_top1":         val_metrics.get("top1", 0.0),
+                    "epoch/val_top5":         val_metrics.get("top5", 0.0),
+                    "epoch/lr":               self.optimiser.param_groups[0]["lr"],
+                }
+                self.wandb_run.log(epoch_log, step=(epoch + 1) * len(self.train_loader))
 
             # Save best checkpoint
             current_metric = val_metrics.get("mAP", 0.0)
@@ -197,6 +213,19 @@ class DistillationTrainer:
                     f"loss={loss_dict['total'].item():.4f}  "
                     f"({elapsed:.1f}s elapsed)"
                 )
+                if self.wandb_run is not None:
+                    global_step = epoch * n_batches + batch_idx
+                    self.wandb_run.log(
+                        {
+                            "train/loss_total": loss_dict["total"].item(),
+                            "train/loss_feat":  loss_dict["feat"].item(),
+                            "train/loss_at":    loss_dict["at"].item(),
+                            "train/loss_kd":    loss_dict["kd"].item(),
+                            "train/loss_task":  loss_dict["task"].item(),
+                            "train/lr": self.optimiser.param_groups[0]["lr"],
+                        },
+                        step=global_step,
+                    )
 
         return {k: v / n_batches for k, v in running.items()}
 

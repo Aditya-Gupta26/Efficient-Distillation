@@ -68,6 +68,10 @@ class SwinStudentTiny(nn.Module):
         """
         features = self.backbone(x)
 
+        # timm Swin features_only uses channels-last (B, H, W, C).
+        # Permute to standard (B, C, H, W) for compatibility with adapters / losses.
+        features = [f.permute(0, 3, 1, 2).contiguous() for f in features]
+
         logits = None
         if self.head is not None:
             logits = self.head(features[-1])

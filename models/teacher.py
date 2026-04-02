@@ -100,7 +100,11 @@ class SwinTeacher(nn.Module):
             logits (Tensor | None): Classification logits (B, num_classes),
                 or None if ``num_classes=0``.
         """
-        features = self.backbone(x)          # list of 4 tensors
+        features = self.backbone(x)          # list of 4 tensors, each (B, H, W, C)
+
+        # timm Swin features_only uses channels-last (B, H, W, C).
+        # Permute to standard (B, C, H, W) for compatibility with adapters / losses.
+        features = [f.permute(0, 3, 1, 2).contiguous() for f in features]
 
         logits = None
         if self.head is not None:
@@ -115,10 +119,10 @@ class SwinTeacher(nn.Module):
         """Freeze patch-embed + the first `num_stages` transformer stages."""
         if num_stages < 0:
             return
-        # timm features_only model: patch_embed → layers[0..3]
+        # timm features_only model exposes stages as layers_0 … layers_3
         modules_to_freeze = [self.backbone.patch_embed]
         for i in range(min(num_stages, 4)):
-            modules_to_freeze.append(self.backbone.layers[i])
+            modules_to_freeze.append(getattr(self.backbone, f"layers_{i}"))
         for m in modules_to_freeze:
             for p in m.parameters():
                 p.requires_grad = False
