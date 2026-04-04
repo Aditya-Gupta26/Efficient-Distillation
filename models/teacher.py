@@ -23,9 +23,11 @@ from timm import create_model
 
 
 # Map of supported teacher variants → timm model names
+# swin_large: use the 22K→1K fine-tuned checkpoint so the pretrained head is Linear(1536→1000)
+# swin_base:  base 1K checkpoint already has Linear(1024→1000) natively
 TEACHER_VARIANTS = {
-    "swin_large": "swin_large_patch4_window7_224",       # ~197 M params
-    "swin_base":  "swin_base_patch4_window7_224",        # ~88  M params
+    "swin_large": "swin_large_patch4_window7_224.ms_in22k_ft_in1k",  # ~197 M, head: 1536→1000
+    "swin_base":  "swin_base_patch4_window7_224",                     # ~88  M, head: 1024→1000
 }
 
 # Channel widths emitted at each of the 4 stages
@@ -53,7 +55,7 @@ class SwinTeacher(nn.Module):
         self,
         variant: str = "swin_large",
         pretrained: bool = True,
-        num_classes: int = 80,
+        num_classes: int = 1000,
         frozen_stages: int = 2,
     ):
         super().__init__()
@@ -64,7 +66,15 @@ class SwinTeacher(nn.Module):
         self.variant = variant
         self.stage_channels = TEACHER_STAGE_CHANNELS[variant]
 
-        # Build backbone via timm; features_only=True exposes per-stage outputs
+        # Build a FULL pretrained model using the DEFAULT num_classes so that
+        # timm does NOT replace the pretrained head with a random one.
+        # (passing num_classes != checkpoint default causes timm to re-init the head)
+        full_model = create_model(
+            TEACHER_VARIANTS[variant],
+            pretrained=pretrained,
+        )
+
+        # Now build the features-only backbone for intermediate feature maps
         self.backbone = create_model(
             TEACHER_VARIANTS[variant],
             pretrained=pretrained,
@@ -72,19 +82,42 @@ class SwinTeacher(nn.Module):
             out_indices=(0, 1, 2, 3),
         )
 
-        # Optional classification head (for logit-level distillation)
+        # Transplant the pretrained head from the full model so logits are meaningful
         in_features = self.stage_channels[-1]
         if num_classes > 0:
+            pretrained_head: nn.Linear | None = None
+            if pretrained and hasattr(full_model, "head") and isinstance(full_model.head, nn.Linear):
+                pretrained_head = full_model.head  # shape: (default_classes, in_features)
+
             self.head = nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
                 nn.Flatten(),
                 nn.Linear(in_features, num_classes),
             )
+
+            if pretrained_head is not None:
+                if pretrained_head.out_features == num_classes:
+                    # Shapes match — copy directly
+                    self.head[-1].weight.data.copy_(pretrained_head.weight.data)
+                    self.head[-1].bias.data.copy_(pretrained_head.bias.data)
+                else:
+                    raise ValueError(
+                        f"Pretrained head has {pretrained_head.out_features} output classes "
+                        f"but num_classes={num_classes} was requested. "
+                        f"Pass num_classes={pretrained_head.out_features} to use the pretrained head."
+                    )
         else:
             self.head = None
 
+        del full_model  # free memory
+
         # Freeze early stages to reduce GPU memory during distillation
         self._freeze_stages(frozen_stages)
+
+        # Freeze the head — teacher is never trained, all params must be frozen
+        if self.head is not None:
+            for p in self.head.parameters():
+                p.requires_grad = False
 
     # ------------------------------------------------------------------
     # Forward

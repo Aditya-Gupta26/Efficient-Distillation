@@ -19,7 +19,7 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
 from models.teacher import SwinTeacher
@@ -90,7 +90,7 @@ class DistillationTrainer:
         )
 
         # Mixed-precision scaler
-        self.scaler = GradScaler(enabled=cfg.get("amp", True))
+        self.scaler = GradScaler("cuda", enabled=cfg.get("amp", True))
 
         self.start_epoch = 0
         self.best_metric = 0.0
@@ -125,7 +125,9 @@ class DistillationTrainer:
                 f"(feat={train_losses['feat']:.4f}, "
                 f"at={train_losses['at']:.4f}, "
                 f"kd={train_losses['kd']:.4f}) | "
-                f"Val mAP: {val_metrics.get('mAP', 0.0):.4f}"
+                f"Student Top-1: {val_metrics.get('val_student_top1', 0.0):.4f}  "
+                f"Top-5: {val_metrics.get('val_student_top5', 0.0):.4f}  "
+                f"(Teacher: {val_metrics.get('val_teacher_top1', 0.0):.4f})"
             )
 
             if self.wandb_run is not None:
@@ -135,9 +137,13 @@ class DistillationTrainer:
                     "epoch/train_loss_feat":  train_losses["feat"],
                     "epoch/train_loss_at":    train_losses["at"],
                     "epoch/train_loss_kd":    train_losses["kd"],
-                    "epoch/val_mAP":          val_metrics.get("mAP", 0.0),
-                    "epoch/val_top1":         val_metrics.get("top1", 0.0),
-                    "epoch/val_top5":         val_metrics.get("top5", 0.0),
+                    "epoch/val_loss_feat":    val_metrics.get("val_feat",  0.0),
+                    "epoch/val_loss_at":      val_metrics.get("val_at",    0.0),
+                    "epoch/val_loss_kd":      val_metrics.get("val_kd",    0.0),
+                    "epoch/val_student_top1": val_metrics.get("val_student_top1", 0.0),
+                    "epoch/val_student_top5": val_metrics.get("val_student_top5", 0.0),
+                    "epoch/val_teacher_top1": val_metrics.get("val_teacher_top1", 0.0),
+                    "epoch/val_teacher_top5": val_metrics.get("val_teacher_top5", 0.0),
                     "epoch/lr":               self.optimiser.param_groups[0]["lr"],
                 }
                 self.wandb_run.log(epoch_log, step=(epoch + 1) * len(self.train_loader))
@@ -169,12 +175,19 @@ class DistillationTrainer:
         n_batches = len(self.train_loader)
         t0 = time.time()
 
+        smoke = self.cfg.get("smoke_test_batches", 0)
+
         for batch_idx, batch in enumerate(self.train_loader):
-            images = batch["images"].to(self.device)
+            if smoke and batch_idx >= smoke:
+                self.logger.info(f"  [smoke test] stopping after {smoke} batches")
+                break
+
+            images  = batch["images"].to(self.device)
+            targets = batch["targets"].to(self.device)   # (B,) int64 — always available now
 
             self.optimiser.zero_grad()
 
-            with autocast(enabled=self.cfg.get("amp", True)):
+            with autocast("cuda", enabled=self.cfg.get("amp", True)):
                 # Teacher forward (no_grad – already set via requires_grad=False)
                 with torch.no_grad():
                     t_feats, t_logits = self.teacher(images)
@@ -185,6 +198,11 @@ class DistillationTrainer:
                 # Adapter projection
                 adapted_s_feats = self.adapter(s_feats, t_feats)
 
+                # Optional ground-truth cross-entropy task loss
+                task_loss = None
+                if self.cfg.get("use_gt_loss", False) and s_logits is not None:
+                    task_loss = nn.functional.cross_entropy(s_logits, targets)
+
                 # Compute losses
                 loss_dict = self.loss_fn(
                     adapted_student_feats=adapted_s_feats,
@@ -192,6 +210,7 @@ class DistillationTrainer:
                     student_feats_raw=s_feats,
                     student_logits=s_logits,
                     teacher_logits=t_logits,
+                    task_loss=task_loss,
                 )
 
             self.scaler.scale(loss_dict["total"]).backward()
@@ -234,25 +253,56 @@ class DistillationTrainer:
         self.student.eval()
         self.adapter.eval()
 
-        all_preds, all_targets = [], []
+        smoke = self.cfg.get("smoke_test_batches", 0)
+        s_preds, t_preds, all_targets = [], [], []
+        running_val = {"feat": 0.0, "at": 0.0, "kd": 0.0}
+        n_batches = 0
 
         with torch.no_grad():
-            for batch in self.val_loader:
-                images = batch["images"].to(self.device)
-                targets = batch.get("targets", None)
+            for batch_idx, batch in enumerate(self.val_loader):
+                if smoke and batch_idx >= smoke:
+                    break
 
+                images  = batch["images"].to(self.device)
+                targets = batch["targets"]          # (B,) int64 — ImageNet class indices
+
+                t_feats, t_logits = self.teacher(images)
                 s_feats, s_logits = self.student(images)
+                adapted_s_feats   = self.adapter(s_feats, t_feats)
+
+                # Val distillation losses (unweighted, for monitoring)
+                l_feat = self.loss_fn.feature_loss(adapted_s_feats, t_feats)
+                l_at   = self.loss_fn.attention_transfer_loss(s_feats, t_feats)
+                l_kd   = self.loss_fn.kd_loss(s_logits, t_logits) if (s_logits is not None and t_logits is not None) else torch.tensor(0.0)
+
+                running_val["feat"] += l_feat.item()
+                running_val["at"]   += l_at.item()
+                running_val["kd"]   += l_kd.item()
+                n_batches += 1
 
                 if s_logits is not None:
-                    all_preds.append(s_logits.cpu())
-                if targets is not None:
-                    all_targets.append(targets.cpu())
+                    s_preds.append(s_logits.cpu())
+                if t_logits is not None:
+                    t_preds.append(t_logits.cpu())
+                all_targets.append(targets.cpu())
 
-        if all_preds and all_targets:
-            preds   = torch.cat(all_preds, dim=0)
-            targets = torch.cat(all_targets, dim=0)
-            metrics = compute_metrics(preds, targets)
-        else:
-            metrics = {}
+        metrics = {k: v / max(n_batches, 1) for k, v in running_val.items()}
+        metrics = {f"val_{k}": v for k, v in metrics.items()}
+
+        if all_targets:
+            targets_cat = torch.cat(all_targets, dim=0)
+
+            # Student accuracy
+            if s_preds:
+                s_acc = compute_metrics(torch.cat(s_preds, dim=0), targets_cat)
+                metrics["val_student_top1"] = s_acc.get("top1", 0.0)
+                metrics["val_student_top5"] = s_acc.get("top5", 0.0)
+                metrics["mAP"] = s_acc.get("top1", 0.0)   # used for checkpoint best-metric
+
+            # Teacher accuracy (ceiling reference)
+            if t_preds:
+                t_acc = compute_metrics(torch.cat(t_preds, dim=0), targets_cat)
+                metrics["val_teacher_top1"] = t_acc.get("top1", 0.0)
+                metrics["val_teacher_top5"] = t_acc.get("top5", 0.0)
 
         return metrics

@@ -5,9 +5,9 @@
 # ----------------------------------------------------------
 # Dataset
 # ----------------------------------------------------------
-coco_root:   "/scratch/ag11023/HPML/coco"  # Path to COCO root directory
+imagenet_root: "/scratch/ag11023/HPML/imagenet"  # Path to ImageNet root (train/ and val/ subdirs)
 img_size:    224                   # Input image resolution (H = W)
-batch_size:  32                    # Per-GPU batch size
+batch_size:  256                   # Per-GPU batch size (A100 80GB can handle 256 easily)
 num_workers: 8
 pin_memory:  true
 
@@ -21,8 +21,8 @@ teacher_frozen_stages:  4              # Freeze ALL teacher stages during distil
 # ----------------------------------------------------------
 # Student  (Swin-Tiny ~28M)
 # ----------------------------------------------------------
-student_pretrained:  true
-num_classes:         80                # COCO categories
+student_pretrained:  true   # random init — shows training progress from scratch
+num_classes:         1000          # ImageNet-1K classes
 
 # ----------------------------------------------------------
 # Adapters
@@ -34,25 +34,27 @@ adapter_spatial_align:  true
 # Distillation loss weights
 # ----------------------------------------------------------
 w_feat:          1.0    # Feature-level MSE / cosine
-w_at:            0.5    # Attention transfer
+w_at:            1.0    # Attention transfer
 w_kd:            1.0    # Logit-level KL divergence
-w_task:          1.0    # Task loss (detection / segmentation)
-feat_loss_type:  "mse"  # "mse" | "cosine"
+w_task:          1.0    # Task loss weight (cross-entropy vs ground truth)
+use_gt_loss:     true   # Add CrossEntropy(student_logits, true_labels) as task loss
+feat_loss_type:  "cosine"  # "mse" | "cosine"  — cosine is scale-invariant, avoids feat dominating
 temperature:     4.0    # KD temperature (τ)
 
 # ----------------------------------------------------------
 # Optimiser & scheduler
 # ----------------------------------------------------------
-lr:            1.0e-4
+lr:            8.0e-4   # Scaled linearly from 1e-4 @ bs=32 → 1e-4 * (256/32) = 8e-4
 lr_min:        1.0e-6
 weight_decay:  1.0e-2
 grad_clip:     1.0
-epochs:        1000
+epochs:        100      # Standard for ImageNet distillation (DeiT/TinyViT use 100-300)
 
 # ----------------------------------------------------------
 # Mixed precision & checkpointing
 # ----------------------------------------------------------
-amp:       true
+amp:     true
+compile: true                        # torch.compile student+adapter (~20% speedup on A100)
 log_every: 50                        # Log every N batches
 save_dir:  "checkpoints"
 resume:    null                      # Set to a .pth path to resume

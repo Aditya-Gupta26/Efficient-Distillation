@@ -17,7 +17,7 @@ from models.student import SwinStudentTiny
 from models.adapters import FeatureAdapter
 from distillation.losses import DistillationLoss
 from distillation.trainer import DistillationTrainer
-from data.coco_dataset import build_coco_dataloaders
+from data.imagenet_dataset import build_imagenet_dataloaders
 from utils.logger import setup_logger
 from utils.wandb_logger import init_wandb
 
@@ -27,7 +27,29 @@ def parse_args():
     parser.add_argument("--config", type=str, default="configs/distill_config.yaml")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint to resume training from.")
+    parser.add_argument("--override", nargs="*", default=[],
+                        metavar="KEY=VALUE",
+                        help="Override config values, e.g. --override w_feat=0.1 temperature=6.0 feat_loss_type=mse")
     return parser.parse_args()
+
+
+def apply_overrides(cfg: dict, overrides: list[str]) -> dict:
+    """Apply KEY=VALUE overrides to a config dict, casting to int/float/bool where appropriate."""
+    for item in overrides:
+        if "=" not in item:
+            raise ValueError(f"Invalid override '{item}', expected KEY=VALUE format.")
+        key, raw = item.split("=", 1)
+        # Type casting: try int → float → bool → string
+        for cast in (int, float):
+            try:
+                raw = cast(raw); break
+            except ValueError:
+                pass
+        else:
+            if raw.lower() in ("true", "false"):
+                raw = raw.lower() == "true"
+        cfg[key] = raw
+    return cfg
 
 
 def load_config(path: str) -> dict:
@@ -38,6 +60,7 @@ def load_config(path: str) -> dict:
 def main():
     args   = parse_args()
     cfg    = load_config(args.config)
+    cfg    = apply_overrides(cfg, args.override)
     logger = setup_logger("train")
 
     # Allow CLI override for resume path
@@ -47,6 +70,16 @@ def main():
     # ------------------------------------------------------------------ #
     # Weights & Biases
     # ------------------------------------------------------------------ #
+    # Smoke-test: skip wandb entirely
+    if cfg.get("smoke_test_batches", 0):
+        cfg.setdefault("wandb", {})["enabled"] = False
+        logger.info("smoke_test_batches set — W&B disabled for this run")
+
+    # Build a descriptive run name from any CLI overrides
+    if args.override and cfg.get("wandb", {}).get("run_name") is None:
+        tag = "_".join(o.replace("=", "") for o in args.override)
+        cfg.setdefault("wandb", {})["run_name"] = tag
+
     wandb_run = init_wandb(cfg)
 
     # ------------------------------------------------------------------ #
@@ -63,15 +96,15 @@ def main():
     # ------------------------------------------------------------------ #
     # Data
     # ------------------------------------------------------------------ #
-    train_loader, val_loader = build_coco_dataloaders(
-        coco_root   = cfg["coco_root"],
-        img_size    = cfg.get("img_size", 224),
-        batch_size  = cfg.get("batch_size", 32),
-        num_workers = cfg.get("num_workers", 8),
-        pin_memory  = cfg.get("pin_memory", True),
+    train_loader, val_loader = build_imagenet_dataloaders(
+        imagenet_root = cfg["imagenet_root"],
+        img_size      = cfg.get("img_size", 224),
+        batch_size    = cfg.get("batch_size", 32),
+        num_workers   = cfg.get("num_workers", 8),
+        pin_memory    = cfg.get("pin_memory", True),
     )
     logger.info(
-        f"COCO  train: {len(train_loader.dataset):,} images  |  "
+        f"ImageNet  train: {len(train_loader.dataset):,} images  |  "
         f"val: {len(val_loader.dataset):,} images"
     )
 
@@ -82,12 +115,12 @@ def main():
     teacher = SwinTeacher(
         variant       = teacher_variant,
         pretrained    = cfg.get("teacher_pretrained", True),
-        num_classes   = cfg.get("num_classes", 80),
+        num_classes   = cfg.get("num_classes", 1000),
         frozen_stages = cfg.get("teacher_frozen_stages", 4),   # fully frozen
     )
     student = SwinStudentTiny(
         pretrained  = cfg.get("student_pretrained", True),
-        num_classes = cfg.get("num_classes", 80),
+        num_classes = cfg.get("num_classes", 1000),
     )
     logger.info(
         f"Teacher ({teacher_variant})  params: {teacher.num_parameters:,}  "
@@ -108,6 +141,20 @@ def main():
         use_spatial_align= cfg.get("adapter_spatial_align", True),
     )
     logger.info(f"Adapter params: {adapter.num_parameters:,}")
+
+    # ------------------------------------------------------------------ #
+    # torch.compile  (~15-30% throughput gain on A100, free)
+    # Requires triton; falls back to eager if not available.
+    # ------------------------------------------------------------------ #
+    if cfg.get("compile", True) and hasattr(torch, "compile"):
+        try:
+            import triton  # noqa: F401
+            logger.info("Compiling student and adapter with torch.compile ...")
+            student = torch.compile(student)
+            adapter = torch.compile(adapter)
+            logger.info("torch.compile done.")
+        except ImportError:
+            logger.warning("triton not found — skipping torch.compile (pip install triton to enable).")
 
     # ------------------------------------------------------------------ #
     # Loss
