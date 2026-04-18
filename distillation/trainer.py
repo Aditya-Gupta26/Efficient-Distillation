@@ -102,6 +102,64 @@ class DistillationTrainer:
                 ckpt_path, self.student, self.adapter, self.optimiser, self.scheduler
             )
             self.logger.info(f"Resumed from checkpoint: {ckpt_path}")
+        else:
+            # Warm-start adapters only from a previous checkpoint.
+            # Used when student_pretrained=False: the randomly-initialised student
+            # produces feature maps with an arbitrary scale/distribution on step 0,
+            # which causes the adapter outputs to be near-zero-norm vectors →
+            # cosine loss is undefined → NaN in loss_feat.
+            # Loading previously-trained adapter weights gives the projections a
+            # sensible starting point without touching the student, optimiser, or
+            # scheduler — so training still proceeds from epoch 0 with a fresh student.
+            warm_start_path = cfg.get("adapter_warm_start", None)
+            if warm_start_path and os.path.isfile(warm_start_path):
+                self._load_adapter_warm_start(warm_start_path)
+
+    def _load_adapter_warm_start(self, path: str) -> None:
+        """Load **only** the adapter weights from ``path``.
+
+        The student, optimiser, scheduler, and epoch counter are left untouched
+        so that training starts fresh from epoch 0 with a randomly-initialised
+        student and warm-started adapter projections.
+        """
+        ckpt = torch.load(path, map_location="cpu", weights_only=True)
+        if "adapter" not in ckpt:
+            self.logger.warning(
+                f"[adapter_warm_start] No 'adapter' key found in {path} — skipping."
+            )
+            return
+
+        state_dict = ckpt["adapter"]
+
+        # Checkpoints saved while torch.compile was active store keys prefixed
+        # with '_orig_mod.' (e.g. '_orig_mod.adapters.stage_0.proj.0.weight').
+        # The live adapter at warm-start time is the unwrapped module (compile
+        # happens after __init__), so strip that prefix if present.
+        if any(k.startswith("_orig_mod.") for k in state_dict):
+            state_dict = {
+                k.removeprefix("_orig_mod."): v for k, v in state_dict.items()
+            }
+
+        # Handle torch.compile wrapping on the live model side just in case
+        adapter_target = (
+            self.adapter._orig_mod
+            if hasattr(self.adapter, "_orig_mod")
+            else self.adapter
+        )
+        missing, unexpected = adapter_target.load_state_dict(state_dict, strict=False)
+        if missing:
+            self.logger.warning(
+                f"[adapter_warm_start] Missing keys when loading adapter: {missing}"
+            )
+        if unexpected:
+            self.logger.warning(
+                f"[adapter_warm_start] Unexpected keys when loading adapter: {unexpected}"
+            )
+        src_epoch = ckpt.get("epoch", "?")
+        self.logger.info(
+            f"[adapter_warm_start] Loaded adapter weights from '{path}' "
+            f"(source epoch {src_epoch}). Student & optimiser remain freshly initialised."
+        )
 
     # ------------------------------------------------------------------
     # Training

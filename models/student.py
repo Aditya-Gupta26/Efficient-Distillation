@@ -6,6 +6,11 @@ Swin-Tiny output channels per stage:
     Stage 1  (1/8  resolution) : 192
     Stage 2  (1/16 resolution) : 384
     Stage 3  (1/32 resolution) : 768
+
+Uses the same single-model pattern as SwinTeacher:
+  - forward_intermediates() for per-stage feature maps (NCHW)
+  - self.model(x)           for logits through the intact pretrained head
+    (which includes LayerNorm + AdaptiveAvgPool + Linear, not just a bare Linear)
 """
 
 import torch
@@ -26,33 +31,26 @@ class SwinStudentTiny(nn.Module):
     Args:
         pretrained (bool): Load ImageNet-1K pretrained weights via timm.
             Useful as a warm-start before distillation.
-        num_classes (int): Number of output classes.
+        num_classes (int): Number of output classes (default: 1000).
     """
 
     def __init__(
         self,
         pretrained: bool = True,
-        num_classes: int = 80,
+        num_classes: int = 1000,
     ):
         super().__init__()
+        self.num_classes = num_classes
         self.stage_channels = STUDENT_STAGE_CHANNELS
 
-        self.backbone = create_model(
-            SWIN_TINY_MODEL,
-            pretrained=pretrained,
-            features_only=True,
-            out_indices=(0, 1, 2, 3),
-        )
+        # Single model — intact pretrained head (LayerNorm + pool + Linear).
+        # Do NOT pass num_classes here so the pretrained head is preserved.
+        self.model = create_model(SWIN_TINY_MODEL, pretrained=pretrained)
 
-        in_features = self.stage_channels[-1]
-        if num_classes > 0:
-            self.head = nn.Sequential(
-                nn.AdaptiveAvgPool2d(1),
-                nn.Flatten(),
-                nn.Linear(in_features, num_classes),
-            )
-        else:
-            self.head = None
+        # Optionally replace the final classifier if num_classes != 1000
+        if num_classes != 1000:
+            in_features = self.model.head.fc.in_features  # 768 for Swin-Tiny
+            self.model.reset_classifier(num_classes)
 
     # ------------------------------------------------------------------
     # Forward
@@ -63,18 +61,19 @@ class SwinStudentTiny(nn.Module):
             x: Image tensor (B, 3, H, W).
 
         Returns:
-            features (list[Tensor]): Per-stage feature maps.
-            logits   (Tensor | None): Classification logits, or None.
+            features (list[Tensor]): Per-stage feature maps (B, C_i, H_i, W_i).
+            logits   (Tensor | None): Classification logits (B, num_classes), or None.
         """
-        features = self.backbone(x)
-
-        # timm Swin features_only uses channels-last (B, H, W, C).
-        # Permute to standard (B, C, H, W) for compatibility with adapters / losses.
-        features = [f.permute(0, 3, 1, 2).contiguous() for f in features]
+        # forward_intermediates returns (final_features, intermediates_list)
+        _, features = self.model.forward_intermediates(
+            x,
+            indices=[0, 1, 2, 3],   # all 4 Swin stages
+            output_fmt="NCHW",       # (B, C, H, W) — no permute needed
+        )
 
         logits = None
-        if self.head is not None:
-            logits = self.head(features[-1])
+        if self.num_classes > 0:
+            logits = self.model(x)   # full forward through intact pretrained head
 
         return features, logits
 

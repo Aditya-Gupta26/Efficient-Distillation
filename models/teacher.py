@@ -46,8 +46,7 @@ class SwinTeacher(nn.Module):
         variant (str): One of ``"swin_large"`` (default, ~197 M) or
             ``"swin_base"`` (~88 M).
         pretrained (bool): Load ImageNet-22K pretrained weights via timm.
-        num_classes (int): Number of output classes (COCO = 80 for detection
-            head; set to 0 to return raw features only).
+        num_classes (int): Number of output classes (ImageNet-1K = 1000).
         frozen_stages (int): Freeze the first N stages (0 = nothing frozen).
     """
 
@@ -65,59 +64,24 @@ class SwinTeacher(nn.Module):
         )
         self.variant = variant
         self.stage_channels = TEACHER_STAGE_CHANNELS[variant]
+        self.num_classes = num_classes
 
-        # Build a FULL pretrained model using the DEFAULT num_classes so that
-        # timm does NOT replace the pretrained head with a random one.
-        # (passing num_classes != checkpoint default causes timm to re-init the head)
-        full_model = create_model(
+        # Single model — one forward pass produces both intermediate features
+        # AND the final logits via timm's forward_intermediates().
+        # This halves memory vs. keeping a separate features_only backbone.
+        self.model = create_model(
             TEACHER_VARIANTS[variant],
             pretrained=pretrained,
         )
 
-        # Now build the features-only backbone for intermediate feature maps
-        self.backbone = create_model(
-            TEACHER_VARIANTS[variant],
-            pretrained=pretrained,
-            features_only=True,
-            out_indices=(0, 1, 2, 3),
-        )
+        # Freeze everything — teacher is never trained
+        for p in self.model.parameters():
+            p.requires_grad = False
 
-        # Transplant the pretrained head from the full model so logits are meaningful
-        in_features = self.stage_channels[-1]
-        if num_classes > 0:
-            pretrained_head: nn.Linear | None = None
-            if pretrained and hasattr(full_model, "head") and isinstance(full_model.head, nn.Linear):
-                pretrained_head = full_model.head  # shape: (default_classes, in_features)
-
-            self.head = nn.Sequential(
-                nn.AdaptiveAvgPool2d(1),
-                nn.Flatten(),
-                nn.Linear(in_features, num_classes),
-            )
-
-            if pretrained_head is not None:
-                if pretrained_head.out_features == num_classes:
-                    # Shapes match — copy directly
-                    self.head[-1].weight.data.copy_(pretrained_head.weight.data)
-                    self.head[-1].bias.data.copy_(pretrained_head.bias.data)
-                else:
-                    raise ValueError(
-                        f"Pretrained head has {pretrained_head.out_features} output classes "
-                        f"but num_classes={num_classes} was requested. "
-                        f"Pass num_classes={pretrained_head.out_features} to use the pretrained head."
-                    )
-        else:
-            self.head = None
-
-        del full_model  # free memory
-
-        # Freeze early stages to reduce GPU memory during distillation
-        self._freeze_stages(frozen_stages)
-
-        # Freeze the head — teacher is never trained, all params must be frozen
-        if self.head is not None:
-            for p in self.head.parameters():
-                p.requires_grad = False
+        # Optionally unfreeze later stages for fine-tuning (currently all frozen)
+        # _freeze_stages is a no-op here since all params are already frozen,
+        # but kept for API compatibility.
+        self._frozen_stages = frozen_stages
 
     # ------------------------------------------------------------------
     # Forward
@@ -130,18 +94,27 @@ class SwinTeacher(nn.Module):
         Returns:
             features (list[Tensor]): Per-stage feature maps
                 [(B, C_i, H_i, W_i) for i in 0..3].
-            logits (Tensor | None): Classification logits (B, num_classes),
-                or None if ``num_classes=0``.
+            logits (Tensor | None): Classification logits (B, num_classes).
         """
-        features = self.backbone(x)          # list of 4 tensors, each (B, H, W, C)
+        # forward_intermediates returns (intermediates, final_output).
+        # intermediates is a list of stage outputs in channels-last (B, H, W, C).
+        # final_output is the pre-head pooled feature — we still need a full
+        # forward for logits, so we call the model twice only when needed...
+        # Actually timm's forward_intermediates does NOT run the head.
+        # So: get features from forward_intermediates, logits from model(x).
+        # Both share the same backbone weights — no duplication in memory.
 
-        # timm Swin features_only uses channels-last (B, H, W, C).
-        # Permute to standard (B, C, H, W) for compatibility with adapters / losses.
-        features = [f.permute(0, 3, 1, 2).contiguous() for f in features]
+        # forward_intermediates returns (final_features, intermediates_list).
+        # intermediates_list contains per-stage outputs in NCHW format.
+        _, features = self.model.forward_intermediates(
+            x,
+            indices=[0, 1, 2, 3],   # all 4 Swin stages
+            output_fmt="NCHW",       # get (B, C, H, W) directly — no permute needed
+        )
 
         logits = None
-        if self.head is not None:
-            logits = self.head(features[-1])
+        if self.num_classes > 0:
+            logits = self.model(x)   # full forward through intact pretrained head
 
         return features, logits
 
@@ -149,26 +122,18 @@ class SwinTeacher(nn.Module):
     # Helpers
     # ------------------------------------------------------------------
     def _freeze_stages(self, num_stages: int) -> None:
-        """Freeze patch-embed + the first `num_stages` transformer stages."""
-        if num_stages < 0:
-            return
-        # timm features_only model exposes stages as layers_0 … layers_3
-        modules_to_freeze = [self.backbone.patch_embed]
-        for i in range(min(num_stages, 4)):
-            modules_to_freeze.append(getattr(self.backbone, f"layers_{i}"))
-        for m in modules_to_freeze:
-            for p in m.parameters():
-                p.requires_grad = False
+        """No-op: all teacher params are frozen at init. Kept for API compat."""
+        pass
 
     def unfreeze_all(self) -> None:
-        """Unfreeze all backbone parameters (e.g., for fine-tuning)."""
-        for p in self.backbone.parameters():
+        """Unfreeze all parameters (e.g., for fine-tuning the teacher)."""
+        for p in self.model.parameters():
             p.requires_grad = True
 
     @property
     def num_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters())
+        return sum(p.numel() for p in self.model.parameters())
 
     @property
     def num_trainable_parameters(self) -> int:
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return sum(p.numel() for p in self.model.parameters() if p.requires_grad)

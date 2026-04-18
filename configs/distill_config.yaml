@@ -8,7 +8,7 @@
 imagenet_root: "/scratch/ag11023/HPML/imagenet"  # Path to ImageNet root (train/ and val/ subdirs)
 img_size:    224                   # Input image resolution (H = W)
 batch_size:  256                   # Per-GPU batch size (A100 80GB can handle 256 easily)
-num_workers: 8
+num_workers: 16
 pin_memory:  true
 
 # ----------------------------------------------------------
@@ -21,7 +21,7 @@ teacher_frozen_stages:  4              # Freeze ALL teacher stages during distil
 # ----------------------------------------------------------
 # Student  (Swin-Tiny ~28M)
 # ----------------------------------------------------------
-student_pretrained:  true   # random init — shows training progress from scratch
+student_pretrained:  false   # random init — shows training progress from scratch
 num_classes:         1000          # ImageNet-1K classes
 
 # ----------------------------------------------------------
@@ -33,10 +33,10 @@ adapter_spatial_align:  true
 # ----------------------------------------------------------
 # Distillation loss weights
 # ----------------------------------------------------------
-w_feat:          1.0    # Feature-level MSE / cosine
+w_feat:          2.0    # Feature-level MSE / cosine
 w_at:            1.0    # Attention transfer
 w_kd:            1.0    # Logit-level KL divergence
-w_task:          1.0    # Task loss weight (cross-entropy vs ground truth)
+w_task:          0.1    # Task loss weight (cross-entropy vs ground truth)
 use_gt_loss:     true   # Add CrossEntropy(student_logits, true_labels) as task loss
 feat_loss_type:  "cosine"  # "mse" | "cosine"  — cosine is scale-invariant, avoids feat dominating
 temperature:     4.0    # KD temperature (τ)
@@ -57,7 +57,15 @@ amp:     true
 compile: true                        # torch.compile student+adapter (~20% speedup on A100)
 log_every: 50                        # Log every N batches
 save_dir:  "checkpoints"
-resume:    null                      # Set to a .pth path to resume
+resume:    null                      # Set to a .pth path to resume (loads student + adapter + optimiser)
+
+# Warm-start the adapters only from a previous checkpoint.
+# Use this when student_pretrained=false to avoid NaN in loss_feat on the
+# very first steps (randomly-init student → near-zero-norm adapter outputs
+# → cosine similarity undefined).  The student, optimiser, and scheduler
+# are NOT touched — training still starts from epoch 0 with a fresh student.
+# Ignored when `resume` is also set.
+adapter_warm_start: null             # e.g. "checkpoints/epoch_065.pth"
 
 # ----------------------------------------------------------
 # Weights & Biases
@@ -67,4 +75,5 @@ wandb:
   project:  "efficient-distillation"
   entity:   "ag11023-new-york-university"
   run_name: null          # null → wandb auto-generates a name
-  tags:     ["swin", "knowledge-distillation", "coco"]
+  tags:     ["swin", "knowledge-distillation", "imagenet"]
+  mode:     "online"      # "online" | "offline" | "disabled"

@@ -50,7 +50,7 @@ def load_checkpoint(
     Returns:
         (start_epoch, best_metric)
     """
-    ckpt = torch.load(path, map_location="cpu")
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
     student.load_state_dict(ckpt["student"])
     adapter.load_state_dict(ckpt["adapter"])
     if optimiser is not None and "optimiser" in ckpt:

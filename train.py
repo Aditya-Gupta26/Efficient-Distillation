@@ -27,6 +27,10 @@ def parse_args():
     parser.add_argument("--config", type=str, default="configs/distill_config.yaml")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint to resume training from.")
+    parser.add_argument("--adapter_warm_start", type=str, default=None,
+                        help="Path to a checkpoint whose adapter weights are used to "
+                             "warm-start the adapters only (student & optimiser stay fresh). "
+                             "Ignored when --resume is also provided.")
     parser.add_argument("--override", nargs="*", default=[],
                         metavar="KEY=VALUE",
                         help="Override config values, e.g. --override w_feat=0.1 temperature=6.0 feat_loss_type=mse")
@@ -66,6 +70,10 @@ def main():
     # Allow CLI override for resume path
     if args.resume:
         cfg["resume"] = args.resume
+
+    # Allow CLI override for adapter warm-start path (ignored if --resume is also set)
+    if args.adapter_warm_start and not cfg.get("resume"):
+        cfg["adapter_warm_start"] = args.adapter_warm_start
 
     # ------------------------------------------------------------------ #
     # Weights & Biases
