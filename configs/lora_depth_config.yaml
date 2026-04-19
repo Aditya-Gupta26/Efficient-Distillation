@@ -1,0 +1,65 @@
+# ============================================================
+# LoRA Depth — LoRA on frozen student + trainable DPT head
+# Dataset: NYU-Depth V2
+# ============================================================
+
+task: "lora_depth"
+
+# ----------------------------------------------------------
+# Dataset
+# ----------------------------------------------------------
+nyu_depth_root: "/scratch/ag11023/HPML/nyu_depth_v2"
+img_size:    224
+batch_size:  16
+num_workers: 8
+pin_memory:  true
+
+# ----------------------------------------------------------
+# Student (distilled backbone — frozen, LoRA adapters added)
+# ----------------------------------------------------------
+student_checkpoint: "checkpoints/epoch_069.pth"
+
+# Pretrained depth checkpoint (student+DPT trained in Phase 3).
+# null = start DPT head from pretrained Intel/dpt-swinv2-tiny-256 weights.
+depth_checkpoint: null   # e.g. "checkpoints/depth/best.pth"
+dpt_pretrained:   true
+
+# ----------------------------------------------------------
+# LoRA
+# ----------------------------------------------------------
+lora_r:              4       # rank
+lora_alpha:          1.0     # scaling factor (effective scale = alpha/r = 0.25)
+lora_target_modules: ["qkv"] # attention projection layers to adapt
+
+# false → LoRA + DPT head both train  (default, recommended)
+# true  → only LoRA adapters train, DPT head completely frozen
+freeze_dpt_head: false
+
+# ----------------------------------------------------------
+# Optimiser & scheduler  (LoRA params + DPT head train)
+# ----------------------------------------------------------
+lr:           5.0e-5
+lr_min:       1.0e-7
+weight_decay: 1.0e-2
+grad_clip:    1.0
+epochs:       30
+
+# ----------------------------------------------------------
+# Mixed precision & checkpointing
+# ----------------------------------------------------------
+amp:       true
+compile:   false
+log_every: 20
+save_dir:  "checkpoints/lora_depth"
+resume:    null
+
+# ----------------------------------------------------------
+# Weights & Biases
+# ----------------------------------------------------------
+wandb:
+  enabled:  true
+  project:  "efficient-distillation"
+  entity:   "ag11023-new-york-university"
+  run_name: null
+  tags:     ["swin", "depth-estimation", "lora", "nyu-depth-v2"]
+  mode:     "online"

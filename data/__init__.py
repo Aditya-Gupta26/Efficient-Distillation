@@ -1,1 +1,2 @@
 from .coco_dataset import build_coco_dataloaders
+from .nyu_depth_dataset import build_nyu_depth_dataloaders
