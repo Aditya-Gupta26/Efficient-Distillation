@@ -22,14 +22,45 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
+from PIL import Image
 
 from utils.logger import setup_logger
+
+_IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+_IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+_VIS_N_IMAGES  = 4   # number of val images to visualise per checkpoint
+
+
+def _denorm_rgb(t: torch.Tensor) -> np.ndarray:
+    """(3,H,W) normalised tensor → (H,W,3) uint8."""
+    img = (t.cpu() * _IMAGENET_STD + _IMAGENET_MEAN).clamp(0, 1)
+    return (img.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+
+
+def _depth_to_colormap(arr: np.ndarray, mask_zeros: bool = False) -> np.ndarray:
+    """Float depth array → (H,W,3) uint8 plasma colormap."""
+    if mask_zeros:
+        valid = arr[arr > 0]
+        lo, hi = (valid.min(), valid.max()) if valid.size else (0.0, 1.0)
+    else:
+        lo, hi = arr.min(), arr.max()
+    norm = np.clip((arr - lo) / (hi - lo + 1e-8), 0.0, 1.0)
+    gray = (norm * 255).astype(np.uint8)
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.cm as cm
+        rgba = cm.plasma(gray.astype(np.float32) / 255.0)
+        return (rgba[:, :, :3] * 255).astype(np.uint8)
+    except ImportError:
+        return np.stack([gray, gray, gray], axis=-1)
 
 
 class DepthTrainer:
@@ -45,7 +76,7 @@ class DepthTrainer:
         wandb_run:    optional W&B run object.
     """
 
-    SILOG_LAMBDA = 0.85
+    SILOG_LAMBDA = 0.5   # 0.85 is nearly scale-invariant; 0.5 gives stronger scale gradient
 
     def __init__(
         self,
@@ -73,12 +104,24 @@ class DepthTrainer:
             lr           = cfg.get("lr", 1e-4),
             weight_decay = cfg.get("weight_decay", 1e-2),
         )
-        self.scheduler = CosineAnnealingLR(
+        warmup_epochs = cfg.get("warmup_epochs", 5)
+        cosine = CosineAnnealingLR(
             self.optimiser,
-            T_max   = cfg.get("epochs", 50),
+            T_max   = max(cfg.get("epochs", 50) - warmup_epochs, 1),
             eta_min = cfg.get("lr_min", 1e-6),
         )
-        self.scaler = GradScaler(enabled=cfg.get("amp", True))
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            self.optimiser,
+            start_factor = 0.1,
+            end_factor   = 1.0,
+            total_iters  = warmup_epochs,
+        )
+        self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+            self.optimiser,
+            schedulers  = [warmup, cosine],
+            milestones  = [warmup_epochs],
+        )
+        self.scaler = GradScaler("cuda", enabled=cfg.get("amp", True))
 
         self.epochs      = cfg.get("epochs", 50)
         self.log_every   = cfg.get("log_every", 20)
@@ -90,6 +133,11 @@ class DepthTrainer:
         self.best_rmse    = float("inf")
 
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.vis_dir = self.save_dir / "vis"
+        self.vis_dir.mkdir(parents=True, exist_ok=True)
+
+        # Fix a small val batch for consistent epoch visualisations
+        self._vis_batch = self._grab_vis_batch()
 
         if cfg.get("resume"):
             self._resume(cfg["resume"])
@@ -126,8 +174,18 @@ class DepthTrainer:
                     "lr":             self.scheduler.get_last_lr()[0],
                 })
 
-            # Save latest checkpoint
-            self._save(epoch, val_metrics["rmse"])
+            # Auto-rollback if RMSE spikes badly (scale explosion)
+            if val_metrics["rmse"] > self.best_rmse * 3.0 and self.best_rmse < float("inf"):
+                self.logger.warning(
+                    f"  RMSE {val_metrics['rmse']:.2f} >> 3× best {self.best_rmse:.2f} "
+                    f"— rolling back to best checkpoint and halving LR"
+                )
+                self._rollback_to_best()
+            else:
+                self._save(epoch, val_metrics["rmse"])
+
+            if (epoch + 1) % self.cfg.get("vis_every", 10) == 0:
+                self._visualize(epoch + 1)
 
     # ------------------------------------------------------------------
     # Training
@@ -148,7 +206,7 @@ class DepthTrainer:
 
             self.optimiser.zero_grad()
 
-            with autocast(enabled=self.amp):
+            with autocast("cuda", enabled=self.amp):
                 pred = self.model(images)          # (B, 1, H, W)
                 pred = pred.squeeze(1)             # (B, H, W)
                 loss = self._silog_loss(pred, depths)
@@ -191,7 +249,7 @@ class DepthTrainer:
             images = batch["images"].to(self.device, non_blocking=True)
             depths = batch["depths"].to(self.device, non_blocking=True)
 
-            with autocast(enabled=self.amp):
+            with autocast("cuda", enabled=self.amp):
                 pred = self.model(images).squeeze(1)  # (B, H, W)
 
             m = self._depth_metrics(pred, depths)
@@ -247,6 +305,57 @@ class DepthTrainer:
         return {"rmse": rmse, "abs_rel": abs_rel, "delta1": delta1}
 
     # ------------------------------------------------------------------
+    # Visualisation
+    # ------------------------------------------------------------------
+
+    def _grab_vis_batch(self) -> dict:
+        """Pull the first _VIS_N_IMAGES samples from the val loader and pin them."""
+        images, depths = [], []
+        for batch in self.val_loader:
+            images.append(batch["images"])
+            depths.append(batch["depths"])
+            if sum(t.size(0) for t in images) >= _VIS_N_IMAGES:
+                break
+        images = torch.cat(images, dim=0)[:_VIS_N_IMAGES]
+        depths = torch.cat(depths, dim=0)[:_VIS_N_IMAGES]
+        return {"images": images, "depths": depths}
+
+    @torch.no_grad()
+    def _visualize(self, epoch: int) -> None:
+        self.model.eval()
+        images = self._vis_batch["images"].to(self.device)
+        depths = self._vis_batch["depths"]          # keep on CPU for numpy
+
+        with autocast("cuda", enabled=self.amp):
+            preds = self.model(images).squeeze(1).cpu()   # (N, H, W)
+
+        border = np.ones((images.shape[2], 4, 3), dtype=np.uint8) * 180
+        wandb_images = []
+
+        for i in range(images.size(0)):
+            rgb_panel  = _denorm_rgb(images[i].cpu())
+            pred_panel = _depth_to_colormap(preds[i].numpy(),  mask_zeros=False)
+            gt_panel   = _depth_to_colormap(depths[i].numpy(), mask_zeros=True)
+
+            row = np.concatenate([rgb_panel, border, pred_panel, border, gt_panel], axis=1)
+
+            # Save to disk
+            out_path = self.vis_dir / f"epoch_{epoch:03d}_sample_{i:02d}.png"
+            Image.fromarray(row).save(out_path)
+
+            if self.wandb_run is not None:
+                import wandb
+                wandb_images.append(
+                    wandb.Image(row, caption=f"epoch {epoch} | sample {i} | RGB / Pred / GT")
+                )
+
+        if self.wandb_run is not None:
+            self.wandb_run.log({"val/depth_vis": wandb_images, "epoch": epoch})
+            self.logger.info(f"  Uploaded {len(wandb_images)} depth visualisations to W&B (epoch {epoch})")
+        else:
+            self.logger.info(f"  Saved {images.size(0)} depth visualisations to {self.vis_dir}")
+
+    # ------------------------------------------------------------------
     # Checkpointing
     # ------------------------------------------------------------------
 
@@ -266,6 +375,22 @@ class DepthTrainer:
             best_path = self.save_dir / "best.pth"
             torch.save(state, best_path)
             self.logger.info(f"  ✓ New best RMSE {rmse:.4f} — saved {best_path}")
+
+    def _rollback_to_best(self) -> None:
+        best_path = self.save_dir / "best.pth"
+        if not best_path.exists():
+            self.logger.warning("  No best.pth found — cannot roll back.")
+            return
+        ckpt = torch.load(best_path, map_location="cpu", weights_only=True)
+        self.model.load_state_dict(ckpt["model"])
+        # Halve LR for all param groups
+        for pg in self.optimiser.param_groups:
+            pg["lr"] *= 0.5
+        self.logger.info(
+            f"  Rolled back to epoch {ckpt['epoch']}  "
+            f"(best RMSE {self.best_rmse:.4f})  "
+            f"new LR={self.optimiser.param_groups[0]['lr']:.2e}"
+        )
 
     def _resume(self, path: str) -> None:
         ckpt = torch.load(path, map_location="cpu", weights_only=True)

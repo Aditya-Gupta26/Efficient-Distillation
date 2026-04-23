@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=distill_swin
-#SBATCH --gres=gpu:h200:1
-#SBATCH --time=48:00:00
+#SBATCH --job-name=project
+#SBATCH --gres=gpu:a100:1
+#SBATCH --time=4:00:00
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=16
 #SBATCH --account=torch_pr_355_tandon_advanced
@@ -97,7 +97,7 @@ fi
 
 # ---- launch training ------------------------------------------------------
 python train.py \
-    --config configs/distill_config.yaml \
+    --config configs/depth_config.yaml \
     \$RESUME_ARG \
     \$WARM_START_ARG
 

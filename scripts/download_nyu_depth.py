@@ -151,9 +151,12 @@ def process_mat(mat_path: Path, out_root: Path, dry_run: bool) -> None:
         # HDF5/MATLAB v7.3 stores arrays transposed relative to NumPy convention.
         # images : (3, W, H, N) in file  →  we read as (N, H, W, 3)
         # depths : (W, H, N)    in file  →  we read as (N, H, W)
-        images_ds = f["images"]   # lazy; shape (3, 640, 480, 1449)
-        depths_ds = f["depths"]   # lazy; shape (640, 480, 1449)
-        N = images_ds.shape[-1]
+        # h5py reverses MATLAB's column-major axes:
+        #   MATLAB images (480,640,3,1449) → h5py (1449,3,640,480)
+        #   MATLAB depths (480,640,1449)   → h5py (1449,640,480)
+        images_ds = f["images"]   # h5py shape: (1449, 3, 640, 480)
+        depths_ds = f["depths"]   # h5py shape: (1449, 640, 480)
+        N = images_ds.shape[0]
         print(f"Total samples in .mat: {N}")
 
         # Build index lists
@@ -183,14 +186,14 @@ def _save_split(images_ds, depths_ds, indices: list, split_dir: Path) -> None:
     for out_idx, src_idx in enumerate(tqdm(indices, desc=split_name)):
         # images_ds shape: (3, 640, 480, N) — read one column
         # Transpose (3, W, H) → (H, W, 3) for PIL
-        img_arr = images_ds[:, :, :, src_idx]      # (3, 640, 480)
+        img_arr = images_ds[src_idx, :, :, :]      # (3, 640, 480)
         img_arr = img_arr.transpose(2, 1, 0)        # (480, 640, 3)
         Image.fromarray(img_arr.astype(np.uint8), "RGB").save(
             rgb_dir / f"{out_idx:05d}.jpg", quality=95
         )
 
         # depths_ds shape: (640, 480, N) — depth in metres (float32)
-        d_arr = depths_ds[:, :, src_idx]            # (640, 480)
+        d_arr = depths_ds[src_idx, :, :]            # (640, 480)
         d_arr = d_arr.T                              # (480, 640)
 
         # Store as uint16: value / 256 = metres  (matches nyu_depth_dataset.py)

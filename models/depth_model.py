@@ -47,7 +47,12 @@ def _load_student_from_checkpoint(student: SwinStudentTiny, path: str) -> None:
         if head_keys:
             print(f"[depth_model] Skipped {len(head_keys)} classification-head keys (num_classes=0, expected).")
     if unexpected:
-        print(f"[depth_model] WARNING: {len(unexpected)} unexpected keys in checkpoint.")
+        non_head = [k for k in unexpected if "head" not in k]
+        head_keys = [k for k in unexpected if "head" in k]
+        if head_keys:
+            print(f"[depth_model] Skipped {len(head_keys)} classification-head keys in checkpoint (num_classes=0, expected).")
+        if non_head:
+            print(f"[depth_model] WARNING: {len(non_head)} truly unexpected keys in checkpoint: {non_head[:5]}")
 
 
 class StudentWithDPT(nn.Module):
@@ -82,6 +87,16 @@ class StudentWithDPT(nn.Module):
         # DPT depth head — trainable
         self.dpt_head = DPTDepthHead(pretrained=dpt_pretrained)
 
+        # Per-stage layer norms to bring classification-trained student features
+        # into a range the pretrained DPT neck expects (student stage 2/3 features
+        # can reach ±1000 due to scale-invariant classification training).
+        # elementwise_affine=False: pure normalisation, no learnable gamma/beta.
+        # Learnable affine allows gamma to grow and undo the normalisation over
+        # training, which causes catastrophic scale explosions after ~10 epochs.
+        self.feat_norms = nn.ModuleList([
+            nn.LayerNorm(c, elementwise_affine=False) for c in [96, 192, 384, 768]
+        ])
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -93,6 +108,13 @@ class StudentWithDPT(nn.Module):
         # Student backbone produces 4 NCHW feature maps
         with torch.set_grad_enabled(self.student.training):
             features, _ = self.student(x)
+
+        # Normalise each stage's features to zero-mean unit-variance per channel.
+        # LayerNorm over the channel dim on NCHW: permute to NHWC, norm, permute back.
+        features = [
+            norm(f.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+            for f, norm in zip(features, self.feat_norms)
+        ]
 
         # DPT neck+head → coarse depth map
         depth = self.dpt_head(features)

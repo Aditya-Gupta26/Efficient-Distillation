@@ -17,7 +17,7 @@ pin_memory:  true
 # ----------------------------------------------------------
 # Student (distilled, frozen backbone)
 # ----------------------------------------------------------
-student_checkpoint: "checkpoints/epoch_069.pth"
+student_checkpoint: "checkpoints/sweep_5426108_task3/best.pth"
 # true  → frozen backbone, only DPT head trains  (recommended first run)
 # false → full fine-tuning: student backbone + DPT head both train
 freeze_student: true
@@ -30,11 +30,12 @@ dpt_pretrained: true   # load head weights from Intel/dpt-swinv2-tiny-256
 # ----------------------------------------------------------
 # Optimiser & scheduler  (only DPT head trains)
 # ----------------------------------------------------------
-lr:           1.0e-4
-lr_min:       1.0e-6
-weight_decay: 1.0e-2
-grad_clip:    1.0
-epochs:       50
+lr:            4.0e-5   # 1e-4 explodes pretrained DPT; stable at 4-6e-5
+lr_min:        1.0e-6
+weight_decay:  1.0e-2
+grad_clip:     0.5      # tighter clip for pretrained neck stability
+warmup_epochs: 8        # longer warmup, peak LR is lower so ramp is gentler
+epochs:        10000
 
 # ----------------------------------------------------------
 # Mixed precision & checkpointing
