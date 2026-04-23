@@ -36,6 +36,8 @@ try:
 except ImportError:
     _TIMM_AVAILABLE = False
 
+from torch.utils.data.distributed import DistributedSampler
+
 
 # ---------------------------------------------------------------------------
 # Transforms  (standard ImageNet recipe)
@@ -123,6 +125,9 @@ def build_imagenet_dataloaders(
     batch_size: int = 32,
     num_workers: int = 8,
     pin_memory: bool = True,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Build ImageNet-1K train and val DataLoaders.
@@ -157,10 +162,33 @@ def build_imagenet_dataloaders(
               f"e.g. folder[0] → class {remap[0].item()}")
     collate_fn = make_collate_fn(remap)
 
+    train_sampler = (
+        DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+        )
+        if distributed
+        else None
+    )
+
+    val_sampler = (
+        DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+        )
+        if distributed
+        else None
+    )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
         collate_fn=collate_fn,
@@ -170,6 +198,7 @@ def build_imagenet_dataloaders(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
         collate_fn=collate_fn,

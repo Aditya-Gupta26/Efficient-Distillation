@@ -29,6 +29,7 @@ from distillation.losses import DistillationLoss
 from utils.logger import setup_logger
 from utils.checkpoint import save_checkpoint, load_checkpoint
 from utils.metrics import compute_metrics
+from utils.distributed import is_main_process, reduce_mean, reduce_tensor_sum, wrap_ddp
 
 
 class DistillationTrainer:
@@ -68,6 +69,12 @@ class DistillationTrainer:
         self.device       = device
         self.logger       = setup_logger("DistillationTrainer")
         self.wandb_run    = wandb_run
+        self.is_main_process = is_main_process()
+        self.distributed = cfg.get("distributed", False)
+
+        if self.distributed:
+            self.student = wrap_ddp(self.student, device)
+            self.adapter = wrap_ddp(self.adapter, device)
 
         # Teacher is always in eval mode — we only distil from it
         self.teacher.eval()
@@ -171,6 +178,9 @@ class DistillationTrainer:
         os.makedirs(save_dir, exist_ok=True)
 
         for epoch in range(self.start_epoch, epochs):
+            if hasattr(self.train_loader, "sampler") and hasattr(self.train_loader.sampler, "set_epoch"):
+                self.train_loader.sampler.set_epoch(epoch)
+
             train_losses = self._train_one_epoch(epoch)
             val_metrics  = self._validate(epoch)
 
@@ -188,7 +198,7 @@ class DistillationTrainer:
                 f"(Teacher: {val_metrics.get('val_teacher_top1', 0.0):.4f})"
             )
 
-            if self.wandb_run is not None:
+            if self.wandb_run is not None and self.is_main_process:
                 epoch_log = {
                     "epoch": epoch + 1,
                     "epoch/train_loss_total": train_losses["total"],
@@ -212,16 +222,17 @@ class DistillationTrainer:
             if is_best:
                 self.best_metric = current_metric
 
-            save_checkpoint(
-                path=os.path.join(save_dir, f"epoch_{epoch+1:03d}.pth"),
-                epoch=epoch + 1,
-                student=self.student,
-                adapter=self.adapter,
-                optimiser=self.optimiser,
-                scheduler=self.scheduler,
-                best_metric=self.best_metric,
-                is_best=is_best,
-            )
+            if self.is_main_process:
+                save_checkpoint(
+                    path=os.path.join(save_dir, f"epoch_{epoch+1:03d}.pth"),
+                    epoch=epoch + 1,
+                    student=self.student,
+                    adapter=self.adapter,
+                    optimiser=self.optimiser,
+                    scheduler=self.scheduler,
+                    best_metric=self.best_metric,
+                    is_best=is_best,
+                )
 
     def _train_one_epoch(self, epoch: int) -> Dict[str, float]:
         """Single training epoch."""
@@ -290,7 +301,7 @@ class DistillationTrainer:
                     f"loss={loss_dict['total'].item():.4f}  "
                     f"({elapsed:.1f}s elapsed)"
                 )
-                if self.wandb_run is not None:
+                if self.wandb_run is not None and self.is_main_process:
                     global_step = epoch * n_batches + batch_idx
                     self.wandb_run.log(
                         {
@@ -304,7 +315,9 @@ class DistillationTrainer:
                         step=global_step,
                     )
 
-        return {k: v / n_batches for k, v in running.items()}
+        averages = {k: v / n_batches for k, v in running.items()}
+        averages = {k: reduce_mean(v, self.device) for k, v in averages.items()}
+        return averages
 
     def _validate(self, epoch: int) -> Dict[str, float]:
         """Validation pass – returns a dict of metrics."""
@@ -312,55 +325,93 @@ class DistillationTrainer:
         self.adapter.eval()
 
         smoke = self.cfg.get("smoke_test_batches", 0)
-        s_preds, t_preds, all_targets = [], [], []
+
         running_val = {"feat": 0.0, "at": 0.0, "kd": 0.0}
         n_batches = 0
+
+        s_top1_correct = 0.0
+        s_top5_correct = 0.0
+        t_top1_correct = 0.0
+        t_top5_correct = 0.0
+        n_samples = 0
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.val_loader):
                 if smoke and batch_idx >= smoke:
                     break
 
-                images  = batch["images"].to(self.device)
-                targets = batch["targets"]          # (B,) int64 — ImageNet class indices
+                images = batch["images"].to(self.device)
+                targets = batch["targets"].to(self.device)
 
                 t_feats, t_logits = self.teacher(images)
                 s_feats, s_logits = self.student(images)
-                adapted_s_feats   = self.adapter(s_feats, t_feats)
+                adapted_s_feats = self.adapter(s_feats, t_feats)
 
-                # Val distillation losses (unweighted, for monitoring)
                 l_feat = self.loss_fn.feature_loss(adapted_s_feats, t_feats)
-                l_at   = self.loss_fn.attention_transfer_loss(s_feats, t_feats)
-                l_kd   = self.loss_fn.kd_loss(s_logits, t_logits) if (s_logits is not None and t_logits is not None) else torch.tensor(0.0)
+                l_at = self.loss_fn.attention_transfer_loss(s_feats, t_feats)
+                l_kd = (
+                    self.loss_fn.kd_loss(s_logits, t_logits)
+                    if (s_logits is not None and t_logits is not None)
+                    else torch.tensor(0.0, device=self.device)
+                )
 
                 running_val["feat"] += l_feat.item()
-                running_val["at"]   += l_at.item()
-                running_val["kd"]   += l_kd.item()
+                running_val["at"] += l_at.item()
+                running_val["kd"] += l_kd.item()
                 n_batches += 1
 
+                bsz = targets.size(0)
+                n_samples += bsz
+
                 if s_logits is not None:
-                    s_preds.append(s_logits.cpu())
+                    s_top1 = s_logits.argmax(dim=1)
+                    s_top1_correct += (s_top1 == targets).sum().item()
+
+                    k = min(5, s_logits.size(1))
+                    s_top5 = s_logits.topk(k, dim=1).indices
+                    s_top5_correct += s_top5.eq(targets.unsqueeze(1)).any(dim=1).sum().item()
+
                 if t_logits is not None:
-                    t_preds.append(t_logits.cpu())
-                all_targets.append(targets.cpu())
+                    t_top1 = t_logits.argmax(dim=1)
+                    t_top1_correct += (t_top1 == targets).sum().item()
 
-        metrics = {k: v / max(n_batches, 1) for k, v in running_val.items()}
-        metrics = {f"val_{k}": v for k, v in metrics.items()}
+                    k = min(5, t_logits.size(1))
+                    t_top5 = t_logits.topk(k, dim=1).indices
+                    t_top5_correct += t_top5.eq(targets.unsqueeze(1)).any(dim=1).sum().item()
 
-        if all_targets:
-            targets_cat = torch.cat(all_targets, dim=0)
+        loss_tensor = torch.tensor(
+            [running_val["feat"], running_val["at"], running_val["kd"], n_batches],
+            device=self.device,
+            dtype=torch.float64,
+        )
+        loss_tensor = reduce_tensor_sum(loss_tensor)
+        feat_sum, at_sum, kd_sum, n_batches_total = loss_tensor.tolist()
 
-            # Student accuracy
-            if s_preds:
-                s_acc = compute_metrics(torch.cat(s_preds, dim=0), targets_cat)
-                metrics["val_student_top1"] = s_acc.get("top1", 0.0)
-                metrics["val_student_top5"] = s_acc.get("top5", 0.0)
-                metrics["mAP"] = s_acc.get("top1", 0.0)   # used for checkpoint best-metric
+        metrics = {
+            "val_feat": feat_sum / max(n_batches_total, 1.0),
+            "val_at": at_sum / max(n_batches_total, 1.0),
+            "val_kd": kd_sum / max(n_batches_total, 1.0),
+        }
 
-            # Teacher accuracy (ceiling reference)
-            if t_preds:
-                t_acc = compute_metrics(torch.cat(t_preds, dim=0), targets_cat)
-                metrics["val_teacher_top1"] = t_acc.get("top1", 0.0)
-                metrics["val_teacher_top5"] = t_acc.get("top5", 0.0)
+        acc_tensor = torch.tensor(
+            [
+                s_top1_correct,
+                s_top5_correct,
+                t_top1_correct,
+                t_top5_correct,
+                n_samples,
+            ],
+            device=self.device,
+            dtype=torch.float64,
+        )
+        acc_tensor = reduce_tensor_sum(acc_tensor)
+        s_top1_correct, s_top5_correct, t_top1_correct, t_top5_correct, n_samples_total = acc_tensor.tolist()
+
+        if n_samples_total > 0:
+            metrics["val_student_top1"] = s_top1_correct / n_samples_total
+            metrics["val_student_top5"] = s_top5_correct / n_samples_total
+            metrics["val_teacher_top1"] = t_top1_correct / n_samples_total
+            metrics["val_teacher_top5"] = t_top5_correct / n_samples_total
+            metrics["mAP"] = metrics["val_student_top1"]
 
         return metrics
