@@ -98,16 +98,17 @@ class NyuDepthDataset(Dataset):
     # ------------------------------------------------------------------
 
     def _train_transform(self, rgb: Image.Image, depth: Image.Image):
-        # Resize full image to img_size×img_size (same as Intel DPTImageProcessor)
-        # — preserves full scene context instead of seeing only a crop.
-        # Both RGB and depth resized with the same target size.
-        rgb   = TF.resize(rgb,   [self.img_size, self.img_size], interpolation=TF.InterpolationMode.BICUBIC)
-        depth = TF.resize(depth, [self.img_size, self.img_size], interpolation=TF.InterpolationMode.NEAREST)
-
         # Random horizontal flip (same for both)
         if torch.rand(1) > 0.5:
             rgb   = TF.hflip(rgb)
             depth = TF.hflip(depth)
+
+        # Random crop to img_size — native resolution, no downsampling
+        i, j, h, w = transforms.RandomCrop.get_params(
+            rgb, output_size=(self.img_size, self.img_size)
+        )
+        rgb   = TF.crop(rgb,   i, j, h, w)
+        depth = TF.crop(depth, i, j, h, w)
 
         # Color jitter on RGB only
         rgb = transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2)(rgb)
@@ -115,9 +116,9 @@ class NyuDepthDataset(Dataset):
         return rgb, depth
 
     def _val_transform(self, rgb: Image.Image, depth: Image.Image):
-        # Resize full image — deterministic, matches Intel's inference pipeline
-        rgb   = TF.resize(rgb,   [self.img_size, self.img_size], interpolation=TF.InterpolationMode.BICUBIC)
-        depth = TF.resize(depth, [self.img_size, self.img_size], interpolation=TF.InterpolationMode.NEAREST)
+        # Centre crop to img_size — native resolution, no downsampling
+        rgb   = TF.center_crop(rgb,   self.img_size)
+        depth = TF.center_crop(depth, self.img_size)
         return rgb, depth
 
 

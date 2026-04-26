@@ -17,7 +17,7 @@ pin_memory:  true
 # ----------------------------------------------------------
 # Student (distilled backbone — frozen, LoRA adapters added)
 # ----------------------------------------------------------
-student_checkpoint: "checkpoints/epoch_069.pth"
+student_checkpoint: "checkpoints/sweep_5426108_task3/best.pth"
 
 # Pretrained depth checkpoint (student+DPT trained in Phase 3).
 # null = start DPT head from pretrained Intel/dpt-swinv2-tiny-256 weights.
@@ -33,7 +33,7 @@ lora_target_modules: ["qkv"] # attention projection layers to adapt
 
 # false → LoRA + DPT head both train  (default, recommended)
 # true  → only LoRA adapters train, DPT head completely frozen
-freeze_dpt_head: false
+freeze_dpt_head: true
 
 # ----------------------------------------------------------
 # Optimiser & scheduler  (LoRA params + DPT head train)
@@ -42,7 +42,7 @@ lr:           5.0e-5
 lr_min:       1.0e-7
 weight_decay: 1.0e-2
 grad_clip:    1.0
-epochs:       30
+epochs:       1500
 
 # ----------------------------------------------------------
 # Mixed precision & checkpointing
@@ -50,6 +50,7 @@ epochs:       30
 amp:       true
 compile:   false
 log_every: 20
+vis_every: 50
 save_dir:  "checkpoints/lora_depth"
 resume:    null
 

@@ -76,7 +76,7 @@ class DepthTrainer:
         wandb_run:    optional W&B run object.
     """
 
-    SILOG_LAMBDA = 0.5   # 0.85 is nearly scale-invariant; 0.5 gives stronger scale gradient
+    SILOG_LAMBDA = 0.85
 
     def __init__(
         self,
@@ -104,22 +104,10 @@ class DepthTrainer:
             lr           = cfg.get("lr", 1e-4),
             weight_decay = cfg.get("weight_decay", 1e-2),
         )
-        warmup_epochs = cfg.get("warmup_epochs", 5)
-        cosine = CosineAnnealingLR(
+        self.scheduler = CosineAnnealingLR(
             self.optimiser,
-            T_max   = max(cfg.get("epochs", 50) - warmup_epochs, 1),
+            T_max   = cfg.get("epochs", 50),
             eta_min = cfg.get("lr_min", 1e-6),
-        )
-        warmup = torch.optim.lr_scheduler.LinearLR(
-            self.optimiser,
-            start_factor = 0.1,
-            end_factor   = 1.0,
-            total_iters  = warmup_epochs,
-        )
-        self.scheduler = torch.optim.lr_scheduler.SequentialLR(
-            self.optimiser,
-            schedulers  = [warmup, cosine],
-            milestones  = [warmup_epochs],
         )
         self.scaler = GradScaler("cuda", enabled=cfg.get("amp", True))
 
@@ -174,15 +162,7 @@ class DepthTrainer:
                     "lr":             self.scheduler.get_last_lr()[0],
                 })
 
-            # Auto-rollback if RMSE spikes badly (scale explosion)
-            if val_metrics["rmse"] > self.best_rmse * 3.0 and self.best_rmse < float("inf"):
-                self.logger.warning(
-                    f"  RMSE {val_metrics['rmse']:.2f} >> 3× best {self.best_rmse:.2f} "
-                    f"— rolling back to best checkpoint and halving LR"
-                )
-                self._rollback_to_best()
-            else:
-                self._save(epoch, val_metrics["rmse"])
+            self._save(epoch, val_metrics["rmse"])
 
             if (epoch + 1) % self.cfg.get("vis_every", 10) == 0:
                 self._visualize(epoch + 1)
@@ -375,22 +355,6 @@ class DepthTrainer:
             best_path = self.save_dir / "best.pth"
             torch.save(state, best_path)
             self.logger.info(f"  ✓ New best RMSE {rmse:.4f} — saved {best_path}")
-
-    def _rollback_to_best(self) -> None:
-        best_path = self.save_dir / "best.pth"
-        if not best_path.exists():
-            self.logger.warning("  No best.pth found — cannot roll back.")
-            return
-        ckpt = torch.load(best_path, map_location="cpu", weights_only=True)
-        self.model.load_state_dict(ckpt["model"])
-        # Halve LR for all param groups
-        for pg in self.optimiser.param_groups:
-            pg["lr"] *= 0.5
-        self.logger.info(
-            f"  Rolled back to epoch {ckpt['epoch']}  "
-            f"(best RMSE {self.best_rmse:.4f})  "
-            f"new LR={self.optimiser.param_groups[0]['lr']:.2e}"
-        )
 
     def _resume(self, path: str) -> None:
         ckpt = torch.load(path, map_location="cpu", weights_only=True)

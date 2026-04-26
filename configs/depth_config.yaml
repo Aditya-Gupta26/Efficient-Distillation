@@ -30,12 +30,11 @@ dpt_pretrained: true   # load head weights from Intel/dpt-swinv2-tiny-256
 # ----------------------------------------------------------
 # Optimiser & scheduler  (only DPT head trains)
 # ----------------------------------------------------------
-lr:            4.0e-5   # 1e-4 explodes pretrained DPT; stable at 4-6e-5
-lr_min:        1.0e-6
-weight_decay:  1.0e-2
-grad_clip:     0.5      # tighter clip for pretrained neck stability
-warmup_epochs: 8        # longer warmup, peak LR is lower so ramp is gentler
-epochs:        10000
+lr:           1.0e-4
+lr_min:       1.0e-6
+weight_decay: 1.0e-2
+grad_clip:    1.0
+epochs:       50
 
 # ----------------------------------------------------------
 # Mixed precision & checkpointing
@@ -44,7 +43,7 @@ amp:       true
 compile:   false    # DPT head has dynamic shapes; skip compile
 log_every: 20
 save_dir:  "checkpoints/depth"
-resume:    null
+resume:    "checkpoints/depth/best.pth"
 
 # ----------------------------------------------------------
 # Weights & Biases

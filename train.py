@@ -227,7 +227,11 @@ def _run_lora_depth(cfg: dict, device: torch.device, wandb_run, logger) -> None:
     # Optionally load depth checkpoint (student+DPT already trained)
     if cfg.get("depth_checkpoint"):
         ckpt = torch.load(cfg["depth_checkpoint"], map_location="cpu", weights_only=True)
-        model.load_state_dict(ckpt["model"], strict=True)
+        missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+        if unexpected:
+            logger.warning(f"Depth checkpoint had {len(unexpected)} unexpected keys (ignored): {unexpected[:3]}")
+        if missing:
+            logger.warning(f"Depth checkpoint missing {len(missing)} keys: {missing[:3]}")
         logger.info(f"Loaded depth checkpoint: {cfg['depth_checkpoint']}")
 
     # Freeze everything, then apply LoRA to student attention layers
