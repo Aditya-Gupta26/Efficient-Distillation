@@ -1,15 +1,34 @@
 """
-DPT depth head extracted from Intel/dpt-swinv2-tiny-256.
+DPT depth head for the distilled Swin-Tiny student backbone.
 
-Takes the 4-stage NCHW feature maps from the Swin-Tiny student backbone
-(channels [96, 192, 384, 768]) and produces a dense depth map.
+Architecture: Intel/dpt-swinv2-tiny-256 neck + head (randomly initialised).
 
-The backbone is discarded; only the DPT neck (reassemble + fusion) and
-the depth estimation head are kept and loaded with pretrained weights.
+Why random initialisation (pretrained=False):
+  Intel's pretrained weights were fitted to SwinV2-Tiny features.
+  Our student is a distilled Swin-Tiny v1 with different feature statistics.
+  Random (Xavier) weights plus the InstanceNorm input normalisation below
+  start the neck in a well-conditioned regime from the first training step.
 
-Input  : list of 4 tensors [(B,96,H0,W0), (B,192,H1,W1), (B,384,H2,W2), (B,768,H3,W3)]
-Output : (B, 1, H_in, W_in) depth map in whatever units the head produces
-         (caller is responsible for final bilinear upsample to input resolution)
+Why align_corners=False patch:
+  The HuggingFace DPTFeatureFusionLayer uses
+      F.interpolate(..., scale_factor=2, align_corners=True)
+  in every fusion step.  align_corners=True is a known source of NaN on Apple
+  MPS (PyTorch / Metal backend limitation).  After the neck is constructed we
+  set align_corners=False on every fusion layer — this is the only change
+  needed to make training stable on MPS, CUDA, and CPU alike.
+
+Neck architecture (DPTNeck for dpt-swinv2-tiny-256):
+  convs           : 4 × Conv2d(C_i → 256, 3×3)  where C = [96,192,384,768]
+  fusion_stage    : 4 × DPTFeatureFusionLayer (residual Conv blocks + ×2 upsample)
+
+Head architecture (DPTDepthEstimationHead):
+  Conv2d(256→128, 3×3) → Upsample(×2) → Conv2d(128→32, 3×3) → Conv2d(32→1, 1×1)
+  Internal ReLUs replaced with Identity; F.softplus is the sole output activation.
+
+Input  : list of 4 NCHW tensors  [(B,96,56,56), (B,192,28,28),
+                                   (B,384,14,14), (B,768,7,7)]
+Output : (B, 1, H_out, W_out)  positive depth in metres.
+         Caller (StudentWithDPT) upsamples to the original image size.
 """
 
 from __future__ import annotations
@@ -20,64 +39,97 @@ import torch.nn.functional as F
 
 MODEL_ID = "Intel/dpt-swinv2-tiny-256"
 
-# Student Swin-Tiny stage channels — must match DPT neck_hidden_sizes
+# Swin-Tiny stage output channels — match DPT neck Conv input sizes exactly
 STUDENT_CHANNELS = [96, 192, 384, 768]
 
 
 class DPTDepthHead(nn.Module):
     """
-    Wraps the pretrained DPT neck + head from Intel/dpt-swinv2-tiny-256.
+    DPT neck + head with three targeted fixes for our setup:
 
-    The neck contains:
-      - reassemble_stage : per-stage channel projection + spatial resize
-      - channel_projection: maps each stage to fusion_hidden_size (256)
-      - fusion_stage      : progressive feature fusion
+      Fix 1 — InstanceNorm2d (affine) before the neck
+               Normalises each student feature channel to mean=0, std=1 per
+               sample so the randomly-initialised neck convolutions start in a
+               well-conditioned range regardless of backbone output scale.
 
-    The head is a lightweight Conv stack that outputs a single-channel
-    depth map from the finest fused feature.
+      Fix 2 — align_corners=False in every DPTFeatureFusionLayer
+               Prevents NaN on Apple MPS where align_corners=True triggers a
+               Metal backend bug in F.interpolate.
+
+      Fix 3 — ReLU → Identity inside head.head Sequential + F.softplus output
+               Prevents the dead-gradient / constant-output failure that occurs
+               when the final Conv(32→1) output is uniformly negative for
+               out-of-distribution student features.
 
     Args:
-        pretrained: if True, load weights from HuggingFace hub.
+        pretrained: load HuggingFace weights (default False — use random init).
+                    Only set True if the upstream backbone is SwinV2-Tiny.
     """
 
-    def __init__(self, pretrained: bool = True):
+    def __init__(self, pretrained: bool = False):
         super().__init__()
 
+        from transformers import DPTForDepthEstimation, DPTConfig
         if pretrained:
-            from transformers import DPTForDepthEstimation
             full = DPTForDepthEstimation.from_pretrained(MODEL_ID)
         else:
-            from transformers import DPTForDepthEstimation, DPTConfig
-            cfg = DPTConfig.from_pretrained(MODEL_ID)
-            full = DPTForDepthEstimation(cfg)
+            cfg  = DPTConfig.from_pretrained(MODEL_ID)
+            full = DPTForDepthEstimation(cfg)   # random Xavier weights
 
-        # Extract neck and prediction head; discard backbone
-        self.neck = full.neck
-        self.head = full.head
-
-        # Remember the config so we can query head_in_index if needed
+        self.neck        = full.neck
+        self.head        = full.head
         self._dpt_config = full.config
-
         del full
+
+        # ── Fix 1: per-stage input normalisation ─────────────────────────────
+        # InstanceNorm2d normalises each (sample, channel) pair over H×W.
+        # affine=True adds a learned per-channel scale + shift; these parameters
+        # are trained together with the rest of the DPT head.
+        self.feature_norms = nn.ModuleList([
+            nn.InstanceNorm2d(c, affine=True) for c in STUDENT_CHANNELS
+        ])
+
+        # ── Fix 2: replace align_corners=True → False in all fusion layers ───
+        # DPTFeatureFusionLayer stores self.align_corners and passes it to
+        # F.interpolate.  Flipping the attribute is the minimal targeted fix.
+        for m in self.neck.modules():
+            if hasattr(m, "align_corners"):
+                m.align_corners = False
+
+        # ── Fix 3: remove dead-ReLU activations from the head Sequential ─────
+        # head.head layout after this patch:
+        #   [0] Conv2d(256, 128, 3×3)
+        #   [1] Upsample(×2, bilinear)
+        #   [2] Conv2d(128,  32, 3×3)
+        #   [3] Identity()    ← was ReLU
+        #   [4] Conv2d( 32,   1, 1×1)
+        #   [5] Identity()    ← was ReLU  (softplus is applied in forward())
+        for idx in range(len(self.head.head)):
+            if isinstance(self.head.head[idx], nn.ReLU):
+                self.head.head[idx] = nn.Identity()
 
     def forward(self, features: list[torch.Tensor]) -> torch.Tensor:
         """
         Args:
-            features: 4 NCHW tensors from student's forward_intermediates()
-                      [stage0 (96ch), stage1 (192ch), stage2 (384ch), stage3 (768ch)]
+            features: 4 NCHW tensors from the student backbone's
+                      forward_intermediates(indices=[0,1,2,3], output_fmt='NCHW').
 
         Returns:
-            depth: (B, 1, H_neck, W_neck) — not yet upsampled to input resolution.
-                   Caller should F.interpolate to the original image size.
+            depth: (B, 1, H_out, W_out) — positive depth values.
+                   StudentWithDPT will bilinearly upsample to input resolution.
         """
-        # DPT neck expects a tuple/list of feature maps.
-        # For Swin-based DPT the reassemble layers work on NCHW directly.
-        hidden_states = tuple(features)
+        # Fix 1: normalise student features before the pretrained neck
+        features = [self.feature_norms[i](f) for i, f in enumerate(features)]
 
-        # neck: reassemble → channel_proj → fusion  →  list of fused tensors
-        fused = self.neck(hidden_states)
+        # DPT neck: channel projection (convs) → feature fusion (fusion_stage)
+        fused    = self.neck(tuple(features))
 
-        # head: picks fused[head_in_index] and runs Conv stack
-        depth = self.head(fused)
+        # DPT head: select finest fused feature, run Conv stack
+        # head_in_index = -1 for this config (finest = last element)
+        selected = fused[self._dpt_config.head_in_index]
+        depth    = self.head.head(selected)   # (B, 1, H_out, W_out)
+
+        # Fix 3: smooth positive activation — gradient always non-zero
+        depth = F.softplus(depth)
 
         return depth
