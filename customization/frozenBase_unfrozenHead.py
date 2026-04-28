@@ -39,7 +39,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from customization.shared import run_training, get_fixed_val_indices
 from models.depth_model import StudentWithDPT
 from data.nyu_depth_dataset import build_nyu_depth_dataloaders, NyuDepthDataset
-from utils.device import get_device, pin_memory_for
+from utils.device import get_device, pin_memory_for, get_distributed_info
+from utils.distributed import (
+    setup_distributed,
+    cleanup_distributed,
+    wrap_ddp,
+    is_main_process,
+    barrier,
+)
 
 EXPERIMENT  = "frozenBase_unfrozenHead"
 DESCRIPTION = "Frozen distilled student + random DPT head trained from scratch"
@@ -84,24 +91,32 @@ def build_model(student_checkpoint: str) -> StudentWithDPT:
 
 
 def main():
-    args   = parse_args()
-    device = get_device()
-    print(f"\n{'='*60}")
-    print(f"  {EXPERIMENT}")
-    print(f"  {DESCRIPTION}")
-    print(f"  Device: {device}  |  Epochs: {args.epochs}")
-    print(f"{'='*60}\n")
+    args = parse_args()
+    dist_info = setup_distributed()
+    device = dist_info["device"]
+    if is_main_process():
+        print(f"\n{'='*60}")
+        print(f"  {EXPERIMENT}")
+        print(f"  {DESCRIPTION}")
+        print(f"  Device: {device}  |  Epochs: {args.epochs}")
+        print(f"{'='*60}\n")
 
     # ── Data ──────────────────────────────────────────────────────────────────
     train_loader, val_loader = build_nyu_depth_dataloaders(
-        root=args.nyu_root, img_size=args.img_size,
-        batch_size=args.batch_size, num_workers=args.num_workers,
+        root=args.nyu_root,
+        img_size=args.img_size,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
         pin_memory=pin_memory_for(device),
+        distributed=dist_info["distributed"],
+        rank=dist_info["rank"],
+        world_size=dist_info["world_size"],
     )
     val_dataset = NyuDepthDataset(root=args.nyu_root, split="val", img_size=args.img_size)
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = build_model(args.student_checkpoint).to(device)
+    model = wrap_ddp(model, device)
 
     # ── Optimiser — only DPT head parameters ─────────────────────────────────
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -110,26 +125,31 @@ def main():
 
     # ── W&B ───────────────────────────────────────────────────────────────────
     wandb_run = None
-    try:
-        import wandb
-        wandb_run = wandb.init(
-            project = args.wandb_project,
-            entity  = args.wandb_entity,
-            name    = EXPERIMENT,
-            config  = vars(args),
-            resume  = "allow",
-            tags    = ["frozen-student", "random-head"],
-        )
-        print(f"[wandb] {wandb_run.url}\n")
-    except Exception as e:
-        print(f"[wandb] Disabled ({e})\n")
+    if is_main_process():
+        try:
+            import wandb
+            wandb_run = wandb.init(
+                project = args.wandb_project,
+                entity  = args.wandb_entity,
+                name    = EXPERIMENT,
+                config  = vars(args),
+                resume  = "allow",
+                tags    = ["frozen-student", "random-head"],
+            )
+            print(f"[wandb] {wandb_run.url}\n")
+        except Exception as e:
+            print(f"[wandb] Disabled ({e})\n")
 
     # ── Train ─────────────────────────────────────────────────────────────────
-    run_training(
-        model=model, train_loader=train_loader, val_loader=val_loader,
-        val_dataset=val_dataset, optimiser=optimiser, scheduler=scheduler,
-        device=device, args=args, run_name=EXPERIMENT, wandb_run=wandb_run,
-    )
+    try:
+        run_training(
+            model=model, train_loader=train_loader, val_loader=val_loader,
+            val_dataset=val_dataset, optimiser=optimiser, scheduler=scheduler,
+            device=device, args=args, run_name=EXPERIMENT, wandb_run=wandb_run,
+        )
+        barrier()
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":

@@ -35,7 +35,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from models.depth_model import StudentWithDPT
 from data.nyu_depth_dataset import NyuDepthDataset, build_nyu_depth_dataloaders
-from utils.device import get_device, maybe_autocast, make_scaler, pin_memory_for
+from utils.device import (
+    get_device,
+    maybe_autocast,
+    make_scaler,
+    pin_memory_for,
+    get_distributed_info,
+)
+from utils.distributed import (
+    is_main_process,
+    get_world_size,
+    barrier,
+    unwrap_model,
+)
+from torch.utils.data.distributed import DistributedSampler
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -119,6 +132,39 @@ def silog_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(d.var() + (1.0 - SILOG_LAMBDA) * d.mean() ** 2 + 1e-8)
 
 
+def reduce_metrics_dict(metrics: dict[str, float], device: torch.device) -> dict[str, float]:
+    """
+    Average scalar metrics across all distributed ranks.
+    In single-process mode, returns metrics unchanged.
+    """
+    info = get_distributed_info()
+    if not info["distributed"]:
+        return metrics
+
+    reduced = {}
+    world_size = get_world_size()
+    for k, v in metrics.items():
+        t = torch.tensor(float(v), device=device, dtype=torch.float64)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+        t /= world_size
+        reduced[k] = t.item()
+    return reduced
+
+def reduce_scalar_mean(value: float, device: torch.device) -> float:
+    """
+    Average one scalar across all distributed ranks.
+    In single-process mode, returns the value unchanged.
+    """
+    info = get_distributed_info()
+    if not info["distributed"]:
+        return float(value)
+
+    t = torch.tensor(float(value), device=device, dtype=torch.float64)
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+    t /= get_world_size()
+    return t.item()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # StudentWithDPTUnfrozen — gradients flow through the student backbone
 # ─────────────────────────────────────────────────────────────────────────────
@@ -184,7 +230,7 @@ def load_checkpoint(
         return 0   # no checkpoint yet — start from epoch 0
 
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt["model"])
+    unwrap_model(model).load_state_dict(ckpt["model"])
     optimiser.load_state_dict(ckpt["optimiser"])
     scheduler.load_state_dict(ckpt["scheduler"])
     epoch = ckpt.get("epoch", 0)
@@ -270,12 +316,13 @@ def train_one_epoch(model, loader, optimiser, scaler, device, grad_clip, amp, ep
         scaler.update()
         total_loss += loss.item()
 
-        if (i + 1) % 20 == 0 or (i + 1) == n_batches:
+        if is_main_process() and ((i + 1) % 20 == 0 or (i + 1) == n_batches):
             print(f"  epoch {epoch+1}  [{i+1:>3}/{n_batches}]  "
                   f"loss={loss.item():.4f}  ({time.time()-t0:.0f}s)",
                   end="\r", flush=True)
 
-    print()
+    if is_main_process():
+        print()
     return total_loss / n_batches
 
 
@@ -345,42 +392,53 @@ def run_training(
         best_rmse = torch.load(best_ckpt, map_location="cpu",
                                weights_only=False).get("best_rmse", float("inf"))
 
-    print(f"\n{'Epoch':>6}  {'Loss':>8}  {'RMSE':>7}  {'AbsRel':>7}  "
-          f"{'SILog':>7}  {'δ1':>6}  {'LR':>9}  Time")
-    print("─" * 72)
+    if is_main_process():
+        print(f"\n{'Epoch':>6}  {'Loss':>8}  {'RMSE':>7}  {'AbsRel':>7}  "
+              f"{'SILog':>7}  {'δ1':>6}  {'LR':>9}  Time")
+        print("─" * 72)
 
     for epoch in range(start_epoch, args.epochs):
+        train_sampler = getattr(train_loader, "sampler", None)
+        if isinstance(train_sampler, DistributedSampler):
+            train_sampler.set_epoch(epoch)
         t0 = time.time()
 
         train_loss = train_one_epoch(
             model, train_loader, optimiser, scaler,
             device, args.grad_clip, args.amp, epoch,
         )
-        val_m    = validate(model, val_loader, device, args.amp)
+        train_loss = reduce_scalar_mean(train_loss, device)
+        val_m = validate(model, val_loader, device, args.amp)
+        val_m = reduce_metrics_dict(val_m, device)
         scheduler.step()
         elapsed  = time.time() - t0
         lr_now   = scheduler.get_last_lr()[0]
         is_best  = val_m["rmse"] < best_rmse
 
-        print(f"{epoch+1:>6}  {train_loss:>8.4f}  {val_m['rmse']:>7.4f}  "
-              f"{val_m['abs_rel']:>7.4f}  {val_m['silog']:>7.4f}  "
-              f"{val_m['delta1']:>6.4f}  {lr_now:>9.2e}  {elapsed:.0f}s",
-              flush=True)
+        if is_main_process():
+            print(f"{epoch+1:>6}  {train_loss:>8.4f}  {val_m['rmse']:>7.4f}  "
+                  f"{val_m['abs_rel']:>7.4f}  {val_m['silog']:>7.4f}  "
+                  f"{val_m['delta1']:>6.4f}  {lr_now:>9.2e}  {elapsed:.0f}s",
+                  flush=True)
 
         if is_best:
             best_rmse = val_m["rmse"]
-            print(f"  ✓ New best RMSE {best_rmse:.4f} → {save_dir}/best.pth", flush=True)
+            if is_main_process():
+                print(f"  ✓ New best RMSE {best_rmse:.4f} → {save_dir}/best.pth", flush=True)
 
         # Save checkpoint (always latest.pth, best.pth only on improvement)
-        state = dict(
-            epoch=epoch + 1, model=model.state_dict(),
-            optimiser=optimiser.state_dict(), scheduler=scheduler.state_dict(),
-            best_rmse=best_rmse,
-        )
-        save_checkpoint(state, save_dir, is_best)
+        if is_main_process():
+            state = dict(
+                epoch=epoch + 1,
+                model=unwrap_model(model).state_dict(),
+                optimiser=optimiser.state_dict(),
+                scheduler=scheduler.state_dict(),
+                best_rmse=best_rmse,
+            )
+            save_checkpoint(state, save_dir, is_best)
 
         # W&B: log metrics every epoch
-        if wandb_run is not None:
+        if wandb_run is not None and is_main_process():
             wandb_run.log({
                 "train/loss":      train_loss,
                 "val/rmse":        val_m["rmse"],
@@ -394,11 +452,14 @@ def run_training(
             }, step=epoch + 1)
 
         # W&B: log depth preview image every 10 epochs (tracks visual progress)
-        if wandb_run is not None and ((epoch + 1) % 10 == 0 or epoch == start_epoch):
+        if wandb_run is not None and is_main_process() and ((epoch + 1) % 10 == 0 or epoch == start_epoch):
             log_depth_preview(model, preview_sample, device, epoch + 1,
                               wandb_run, tag="depth_preview")
 
-    print(f"\nDone — {run_name}  |  Best RMSE: {best_rmse:.4f}")
-    if wandb_run is not None:
+    if is_main_process():
+        print(f"\nDone — {run_name}  |  Best RMSE: {best_rmse:.4f}")
+    if wandb_run is not None and is_main_process():
         wandb_run.summary["best_rmse"] = best_rmse
         wandb_run.finish()
+
+    barrier()

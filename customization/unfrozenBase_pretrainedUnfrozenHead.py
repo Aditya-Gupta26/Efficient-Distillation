@@ -43,7 +43,14 @@ from customization.shared import (
     get_fixed_val_indices,
 )
 from data.nyu_depth_dataset import build_nyu_depth_dataloaders, NyuDepthDataset
-from utils.device import get_device, pin_memory_for
+from utils.device import get_device, pin_memory_for, get_distributed_info
+from utils.distributed import (
+    setup_distributed,
+    cleanup_distributed,
+    wrap_ddp,
+    is_main_process,
+    barrier,
+)
 
 EXPERIMENT  = "unfrozenBase_pretrainedUnfrozenHead"
 DESCRIPTION = "Trainable distilled student + pretrained Intel DPT head (both trainable)"
@@ -93,31 +100,40 @@ def build_model(student_checkpoint: str) -> StudentWithDPTUnfrozen:
 
 
 def main():
-    args   = parse_args()
-    device = get_device()
-    print(f"\n{'='*60}")
-    print(f"  {EXPERIMENT}")
-    print(f"  {DESCRIPTION}")
-    print(f"  Device: {device}  |  Epochs: {args.epochs}")
-    print(f"{'='*60}\n")
+    args = parse_args()
+    dist_info = setup_distributed()
+    device = dist_info["device"]
+    if is_main_process():
+        print(f"\n{'='*60}")
+        print(f"  {EXPERIMENT}")
+        print(f"  {DESCRIPTION}")
+        print(f"  Device: {device}  |  Epochs: {args.epochs}")
+        print(f"{'='*60}\n")
 
     # ── Data ──────────────────────────────────────────────────────────────────
     train_loader, val_loader = build_nyu_depth_dataloaders(
-        root=args.nyu_root, img_size=args.img_size,
-        batch_size=args.batch_size, num_workers=args.num_workers,
+        root=args.nyu_root,
+        img_size=args.img_size,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
         pin_memory=pin_memory_for(device),
+        distributed=dist_info["distributed"],
+        rank=dist_info["rank"],
+        world_size=dist_info["world_size"],
     )
     val_dataset = NyuDepthDataset(root=args.nyu_root, split="val", img_size=args.img_size)
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = build_model(args.student_checkpoint).to(device)
+    model = wrap_ddp(model, device)
 
     # ── Optimiser — two param groups with different learning rates ────────────
     # The student is already well-trained so it gets a much lower LR to avoid
     # catastrophic forgetting of its ImageNet-trained representations.
+    base_model = model.module if hasattr(model, "module") else model
     optimiser = AdamW([
-        {"params": model.student.parameters(), "lr": args.lr_student},
-        {"params": model.dpt_head.parameters(), "lr": args.lr_head},
+        {"params": base_model.student.parameters(), "lr": args.lr_student},
+        {"params": base_model.dpt_head.parameters(), "lr": args.lr_head},
     ], weight_decay=args.weight_decay)
 
     # Use the higher lr (head) as T_max reference for the scheduler
@@ -128,26 +144,31 @@ def main():
 
     # ── W&B ───────────────────────────────────────────────────────────────────
     wandb_run = None
-    try:
-        import wandb
-        wandb_run = wandb.init(
-            project = args.wandb_project,
-            entity  = args.wandb_entity,
-            name    = EXPERIMENT,
-            config  = vars(args),
-            resume  = "allow",
-            tags    = ["unfrozen-student", "pretrained-head"],
-        )
-        print(f"[wandb] {wandb_run.url}\n")
-    except Exception as e:
-        print(f"[wandb] Disabled ({e})\n")
+    if is_main_process():
+        try:
+            import wandb
+            wandb_run = wandb.init(
+                project = args.wandb_project,
+                entity  = args.wandb_entity,
+                name    = EXPERIMENT,
+                config  = vars(args),
+                resume  = "allow",
+                tags    = ["unfrozen-student", "pretrained-head"],
+            )
+            print(f"[wandb] {wandb_run.url}\n")
+        except Exception as e:
+            print(f"[wandb] Disabled ({e})\n")
 
     # ── Train ─────────────────────────────────────────────────────────────────
-    run_training(
-        model=model, train_loader=train_loader, val_loader=val_loader,
-        val_dataset=val_dataset, optimiser=optimiser, scheduler=scheduler,
-        device=device, args=args, run_name=EXPERIMENT, wandb_run=wandb_run,
-    )
+    try:
+        run_training(
+            model=model, train_loader=train_loader, val_loader=val_loader,
+            val_dataset=val_dataset, optimiser=optimiser, scheduler=scheduler,
+            device=device, args=args, run_name=EXPERIMENT, wandb_run=wandb_run,
+        )
+        barrier()
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
