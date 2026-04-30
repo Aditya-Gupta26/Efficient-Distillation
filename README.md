@@ -556,7 +556,7 @@ python scripts/upload_ptq_results.py \
 
 ## Environment
 
-Training was performed on **NYU Greene HPC** using SLURM with Singularity containers (CUDA 12.2). The virtual environment is managed with `uv` and pinned to Python 3.11.
+Training was performed on **NYU Torch HPC** using SLURM with Singularity containers (CUDA 12.2). The virtual environment is managed with `uv` and pinned to Python 3.11.
 
 ```
 torch        >= 2.1.0
