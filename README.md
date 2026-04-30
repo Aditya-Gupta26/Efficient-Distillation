@@ -12,6 +12,7 @@ This project distills a large **Swin-Large (~197 M params)** vision transformer 
 2. [Project Milestones](#2-project-milestones)
 3. [Repository Structure](#3-repository-structure)
 4. [Example Commands](#4-example-commands)
+5. [Results](#5-results)
 
 ---
 
@@ -567,3 +568,12 @@ wandb        >= 0.17.0
 ```
 
 All experiments are logged to **Weights & Biases** under the project `efficient-distillation` (entity: `ag11023-new-york-university`).
+
+## 5. Results
+
+Here are some of the results we obtained by running the Depth head over the best performing model (Dataset - NYU-Depth V2)
+
+![Result Image]([https://raw.githubusercontent.com/USERNAME/REPO/BRANCH/PATH/TO/IMAGE.png](https://github.com/Aditya-Gupta26/Distill-Supplementary/blob/main/lora_depth_vis.png))
+
+[![Watch the demo]([assets/demo-thumbnail.png](https://github.com/Aditya-Gupta26/Distill-Supplementary/blob/main/Demo.png))]([https://drive.google.com/file/d/FILE_ID/view](https://drive.google.com/file/d/1Z6mid2-3XJzouem-VoN-fUJJPhHDQBDv/view?usp=share_link))
+
