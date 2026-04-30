@@ -573,7 +573,7 @@ All experiments are logged to **Weights & Biases** under the project `efficient-
 
 Here are some of the results we obtained by running the Depth head over the best performing model (Dataset - NYU-Depth V2)
 
-![Result Image]([https://raw.githubusercontent.com/USERNAME/REPO/BRANCH/PATH/TO/IMAGE.png](https://github.com/Aditya-Gupta26/Distill-Supplementary/blob/main/lora_depth_vis.png))
+![Result Image](https://raw.githubusercontent.com/Aditya-Gupta26/Distill-Supplementary/main/lora_depth_vis.png)
 
-[![Watch the demo]([assets/demo-thumbnail.png](https://github.com/Aditya-Gupta26/Distill-Supplementary/blob/main/Demo.png))]([https://drive.google.com/file/d/FILE_ID/view](https://drive.google.com/file/d/1Z6mid2-3XJzouem-VoN-fUJJPhHDQBDv/view?usp=share_link))
+[Watch the demo](https://drive.google.com/file/d/1Z6mid2-3XJzouem-VoN-fUJJPhHDQBDv/view?usp=share_link)
 
