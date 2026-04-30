@@ -17,7 +17,7 @@ pin_memory:  true
 # ----------------------------------------------------------
 # Student (distilled backbone — frozen, LoRA adapters added)
 # ----------------------------------------------------------
-student_checkpoint: "checkpoints/epoch_069.pth"
+student_checkpoint: "checkpoints/sweep_5426108_task3/best.pth"
 
 # Pretrained depth checkpoint (student+DPT trained in Phase 3).
 # null = start DPT head from pretrained Intel/dpt-swinv2-tiny-256 weights.
@@ -42,7 +42,7 @@ lr:           5.0e-5
 lr_min:       1.0e-7
 weight_decay: 1.0e-2
 grad_clip:    1.0
-epochs:       30
+epochs:       200
 
 # ----------------------------------------------------------
 # Mixed precision & checkpointing
